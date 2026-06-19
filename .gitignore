@@ -42,6 +42,9 @@ test_scene.png
 !error_compensation_data.json
 !pixel_offset_calibration.json
 
+# Local dev tools
+sync.sh
+
 # IDE
 .vscode/
 .idea/
