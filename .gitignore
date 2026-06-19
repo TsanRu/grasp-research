@@ -32,10 +32,10 @@ __pycache__/
 # Media / recordings
 *.mp4
 *.avi
-*.png
 recordings/
 screenshots/
 my_gazebo_data/
+test_scene.png
 
 # Calibration & runtime data
 *.json
