@@ -1,0 +1,57 @@
+# ROS build artifacts
+build/
+devel/
+install/
+logs/
+.catkin_workspace
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Compiled extensions
+*.so
+*.o
+*.a
+
+# Model weights & large data
+*.pt
+*.pth
+*.pkl
+*.npy
+*.onnx
+*.h5
+
+# Point clouds & 3D scans
+*.ply
+*.bag
+
+# Media / recordings
+*.mp4
+*.avi
+*.png
+recordings/
+screenshots/
+my_gazebo_data/
+
+# Calibration & runtime data
+*.json
+!error_compensation_data.json
+!pixel_offset_calibration.json
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# AnyGrasp SDK license (do not commit)
+license/
+license.zip
+*.cpython-*.so
+
+# Logs
+log/
+*.log

@@ -1,0 +1,49 @@
+<?xml version='1.0'?>
+<sdf version="1.4">
+  <model name="hammer">
+    <static>false</static>
+    <link name="link">
+      <inertial>       
+        <pose>-0.028570860769310643 -0.012672673714671625 0.015653484146085365 -1.3922124758496066 -1.5439736609005625 0.18273929130966127</pose> 
+        <mass>0.00025894043237553564</mass>
+        <inertia>
+          <ixx>3.077768644106045e-06</ixx>
+          <ixy>9.26442286059391e-23</ixy>
+          <ixz>1.4196487262941337e-22</ixz>
+          <iyy>3.0006065150009704e-06</iyy>
+          <iyz>-2.1170815361242441e-22</iyz>
+          <izz>9.99391091034929e-08</izz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <mesh>
+            <!-- Use a downsampled mesh for collisions -->
+            <uri>model://048_hammer/google_16k/textured.obj</uri>
+	        </mesh>
+        </geometry>
+        <surface>
+        <!--<friction>
+          <ode>
+            <mu>0.8</mu>
+            <mu2>0.6</mu2>
+          </ode>
+        </friction>-->
+      </surface>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://048_hammer/google_16k/textured.obj</uri>
+	        </mesh>
+        </geometry>
+        <material>
+          <script>
+            <uri>model://048_hammer/hammer.material</uri>
+            <name>hammer</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

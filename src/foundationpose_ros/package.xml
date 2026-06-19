@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>foundationpose_ros</name>
+  <version>1.0.0</version>
+  <description>ROS node bridging FoundationPose (running in Docker) with the grasp system.</description>
+  <maintainer email="aa3695901@gmail.com">rvl</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <export></export>
+</package>

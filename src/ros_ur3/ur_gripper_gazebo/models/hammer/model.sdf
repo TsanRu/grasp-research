@@ -1,0 +1,56 @@
+<?xml version="1.0" ?>
+<sdf version="1.5">
+  <model name="hammer">
+    <!-- <static>true</static> -->
+    <link name="link">
+      <gravity>true</gravity>
+      <!--
+      <pose>0 0 0 0 0 0</pose>
+
+      <collision name="shaft">
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.3</length>
+          </cylinder>
+        </geomtry>
+      </collision>
+      <collision name="head">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.1</radius>
+            <length>0.3</length>
+          </cylinder>
+        </geomtry>
+      </collision>
+-->
+       <inertial>
+        <mass>1.0</mass> <!-- 設定質量 -->
+        <inertia>
+          <ixx>0.02</ixx> <!-- 設定慣性矩陣 -->
+          <iyy>0.02</iyy>
+          <izz>0.02</izz>
+          <ixy>0.0</ixy>
+          <ixz>0.0</ixz>
+          <iyz>0.0</iyz>
+        </inertia>
+      </inertial>
+      
+      <collision name="collision">
+        <geometry>
+          <mesh>
+            <uri>model://hammer/meshes/hammer.dae</uri>
+          </mesh>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://hammer/meshes/hammer.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>

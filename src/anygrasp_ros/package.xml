@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>anygrasp_ros</name>
+  <version>1.0.0</version>
+  <description>ROS integration nodes for AnyGrasp grasp detection with language-guided segmentation.</description>
+  <maintainer email="aa3695901@gmail.com">rvl</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <export></export>
+</package>
