@@ -9,19 +9,22 @@ import tf2_ros
 import tf2_geometry_msgs
 import geometry_msgs.msg
 import numpy as np
-import json  # 💡 新增 json 模組來解析計畫書
+import json
+import random
 from tf.transformations import quaternion_matrix
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray
 from std_msgs.msg import Bool, String
 from copy import deepcopy
 import threading
 
+import math
 import actionlib
 from control_msgs.msg import GripperCommandAction, GripperCommandGoal
 from tf.transformations import quaternion_from_euler, quaternion_multiply
 from tf.transformations import quaternion_matrix, quaternion_from_euler, quaternion_multiply, quaternion_from_matrix
 from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
+from gazebo_msgs.srv import GetModelState
     
 class SimpleGraspController:
     def __init__(self):
@@ -139,6 +142,14 @@ class SimpleGraspController:
 
         self.gripper_len = 0.135
         self.right_grasp_center_z = None
+        self.operation_start_time = None
+        self.latest_fp_pose_cam = None
+        self.metric_mission_start  = None
+        self.metric_inference_time = None
+        self.metric_grasp_time     = None
+        self.metric_rotation_angle = None
+        self.metric_hoe_value      = None
+        self.metric_hoe_label      = None
         
     # --- 設定規劃場景 (加入桌子) ---
     def setup_planning_scene(self):
@@ -149,8 +160,13 @@ class SimpleGraspController:
         self.scene.remove_world_object("table")
         rospy.sleep(0.5)
 
-        # --- 加入桌子 (參數來自您的第一份程式碼) ---
-        table_height = 0.68
+        # --- 加入桌子 ---
+        # 桌面是 ur_base 模型（world 裡 9 個排陣列），top plate center z=0.67501m，
+        # 厚度 0.02m → 頂面實際在 z=0.685m。
+        # 手臂 base joint 在 z=0.69m（桌面上 5mm 的固定座）。
+        # box 設 0.680m（桌面下 5mm）：擋住手臂進入桌體，
+        # 同時留足夠間隙讓 wrist 在 z=0.69m 時不誤觸 box 邊界。
+        table_height = 0.680
         table_size = [2.0, 2.0, table_height]
         
         table_pose = PoseStamped()
@@ -194,9 +210,13 @@ class SimpleGraspController:
         req.link_name_2 = "leftarm_wrist_3_link" if arm == "left" else "rightarm_wrist_3_link"
         
         try:
-            self.attach_srv.call(req)
-            rospy.loginfo(f"✅ 成功 Attach: {object_name} -> {req.link_name_2}")
-            return True
+            resp = self.attach_srv.call(req)
+            if resp.ok:
+                rospy.loginfo(f"✅ 成功 Attach: {object_name} -> {req.link_name_2}")
+                return True
+            else:
+                rospy.logerr(f"❌ Attach 失敗 (ok=False): {object_name} -> {req.link_name_2}")
+                return False
         except rospy.ServiceException as e:
             rospy.logerr(f"❌ Attach 失敗: {e}")
             return False
@@ -472,7 +492,7 @@ class SimpleGraspController:
                 (plan_l, frac_l) = self.left_move_group.compute_cartesian_path(
                     [pose_l_wrist_grasp], 0.01, True)
 
-                if frac_l < 0.9:
+                if frac_l < 0.5:
                     rospy.logwarn(f"接收臂 Approach 規劃不完整 ({frac_l:.2f})")
                     self.safe_retreat(pose_l_wrist_pre, arm="left")
                     self.go_home("left")
@@ -514,9 +534,20 @@ class SimpleGraspController:
                 rospy.sleep(1.0)
                 self.attach_object(object_name, arm="left")
                 self.detach_object(object_name, arm="right")
+                self._remove_collision_mesh(object_name)
                 self.control_gripper(0.0, arm="right")
 
                 rospy.loginfo("🎉 交接成功，開始撤退流程...")
+
+                # 左手目標：三個展示姿態隨機選一，拿著物件離開交接區
+                left_carry_poses = {
+                    "A": [2.2,  -0.5,  -2.2, -1.0,  1.6476,  0.3   ],
+                    "B": [2.6,  -1.6,  -0.8, -0.3,  1.3,    -0.0237],
+                    "C": [0.7,  -0.8,  -2.0, -0.8,  1.8,    -0.3   ],
+                }
+                carry_key = random.choice(list(left_carry_poses.keys()))
+                carry_joints = left_carry_poses[carry_key]
+                rospy.loginfo(f"左手目標姿態: {carry_key}")
 
                 # Step 1（序列）：右手先垂直往上退 15cm，脫離物件空間
                 current_r = self.move_group.get_current_pose().pose
@@ -524,47 +555,29 @@ class SimpleGraspController:
                 lift_r.position.z += 0.15
                 (plan_lift, frac_lift) = self.move_group.compute_cartesian_path(
                     [lift_r], 0.01, True)
-
                 if frac_lift >= 0.9:
                     self.move_group.execute(plan_lift, wait=True)
                     self.move_group.stop()
-                    rospy.loginfo("✅ 右手垂直上移完成，進入同步撤退")
+                    rospy.loginfo("✅ 右手垂直上移完成")
                 else:
-                    rospy.logwarn("⚠️ 右手上移規劃失敗，直接序列撤退")
-                    self.go_home("right")
-                    self.go_home("left")
-                    rospy.loginfo("🎉🎉 雙臂空中交接成功！")
-                    self.result_pub.publish(json.dumps({
-                        "status": "success",
-                        "method": "air_handover"
-                    }))
-                    return True
+                    rospy.logwarn("⚠️ 右手上移規劃失敗，略過")
 
-                # Step 2（同步）：右手回 home + 左手帶物件移到放置區上方
-                current_l = self.left_move_group.get_current_pose().pose
-                place_above = deepcopy(current_l)
-                place_above.position.x = 1.05
-                place_above.position.y = -0.3
-                place_above.position.z = 0.95
-
+                # Step 2：嘗試同步（右手回 home + 左手拿物件移到隨機展示姿態）
                 right_home_joints = [1.43, -1.211, -2.0, 0.0, 1.6476, -0.0237]
                 self.move_group.set_joint_value_target(right_home_joints)
                 plan_right_home = self.move_group.plan()
                 self.move_group.clear_pose_targets()
 
-                self.left_move_group.set_pose_target(place_above)
-                plan_left_place = self.left_move_group.plan()
+                self.left_move_group.set_joint_value_target(carry_joints)
+                plan_left_carry = self.left_move_group.plan()
                 self.left_move_group.clear_pose_targets()
 
-                rospy.loginfo(f"右手 home 規劃: {plan_right_home[0]}")
-                rospy.loginfo(f"左手放置區規劃: {plan_left_place[0]}")
-
-                if plan_right_home[0] and plan_left_place[0]:
-                    rospy.loginfo("✅ 同步：右手回 home + 左手移到放置區")
+                if plan_right_home[0] and plan_left_carry[0]:
+                    rospy.loginfo(f"✅ 同步：右手回 home + 左手移到姿態 {carry_key}")
                     goal_r = FollowJointTrajectoryGoal()
                     goal_r.trajectory = plan_right_home[1].joint_trajectory
                     goal_l = FollowJointTrajectoryGoal()
-                    goal_l.trajectory = plan_left_place[1].joint_trajectory
+                    goal_l.trajectory = plan_left_carry[1].joint_trajectory
                     self.right_traj_client.send_goal(goal_r)
                     self.left_traj_client.send_goal(goal_l)
                     self.right_traj_client.wait_for_result()
@@ -572,36 +585,41 @@ class SimpleGraspController:
                     self.move_group.stop()
                     self.left_move_group.stop()
                     rospy.loginfo("✅ 同步移動完成")
-
-                    # Step 3: 左手動態計算放置高度並放下物件
-                    if self.right_grasp_center_z is not None:
-                        rospy.loginfo(f"Step 3: 動態放置，基準 grasp_center_z={self.right_grasp_center_z:.4f}")
-                        place_down = deepcopy(self.left_move_group.get_current_pose().pose)
-                        place_down.position.z = self.compute_place_wrist_z()
-                        rospy.loginfo(f"  目標 wrist z={place_down.position.z:.4f}")
-                        (plan_down, frac_down) = self.left_move_group.compute_cartesian_path(
-                            [place_down], 0.01, True)
-                        if frac_down > 0.8:
-                            self.left_move_group.execute(plan_down, wait=True)
-                            self.left_move_group.stop()
-                            self.control_gripper(0.0, arm="left")
-                            rospy.sleep(0.5)
-                            rospy.loginfo("✅ 物件放置完成")
-                        else:
-                            rospy.logwarn(f"⚠️ 放置路徑規劃失敗 (frac={frac_down:.2f})，原地釋放")
-                            self.control_gripper(0.0, arm="left")
-                    else:
-                        rospy.logwarn("⚠️ 未記錄右手夾取高度，跳過動態放置，直接釋放")
-                        self.control_gripper(0.0, arm="left")
-
-                    self.go_home("left")
-
                 else:
-                    rospy.logwarn("⚠️ 同步規劃失敗，序列執行")
+                    rospy.logwarn("⚠️ 同步規劃失敗，改為序列執行")
                     self.go_home("right")
-                    self.go_home("left")
+                    self.left_move_group.set_joint_value_target(carry_joints)
+                    plan_left_seq = self.left_move_group.plan()
+                    self.left_move_group.clear_pose_targets()
+                    if plan_left_seq[0]:
+                        self.left_move_group.execute(plan_left_seq[1], wait=True)
+                        self.left_move_group.stop()
+                        rospy.loginfo(f"✅ 序列：左手移到姿態 {carry_key}")
+                    else:
+                        rospy.logwarn(f"⚠️ 左手姿態 {carry_key} 規劃失敗，維持原位")
 
                 rospy.loginfo("🎉🎉 雙臂空中交接成功！")
+                elapsed_total = (
+                    (rospy.Time.now() - self.operation_start_time).to_sec()
+                    if self.operation_start_time is not None else None
+                )
+                _sep = "=" * 48
+                rospy.loginfo(_sep)
+                rospy.loginfo("[EXPERIMENT SUMMARY]")
+                if self.metric_inference_time is not None:
+                    rospy.loginfo(f"  推論時間  (LLM + AnyGrasp) : {self.metric_inference_time:.2f} s")
+                if self.metric_grasp_time is not None:
+                    rospy.loginfo(f"  夾取耗時                    : {self.metric_grasp_time:.2f} s")
+                if elapsed_total is not None:
+                    rospy.loginfo(f"  交接總耗時 (夾取→完成)      : {elapsed_total:.2f} s")
+                if self.metric_rotation_angle is not None:
+                    rospy.loginfo(f"  旋轉量 (rot)                : {self.metric_rotation_angle:+.1f}°")
+                if self.metric_hoe_value is not None:
+                    label = self.metric_hoe_label or "HOE"
+                    rospy.loginfo(f"  {label:<28}: {self.metric_hoe_value:+.1f}°")
+                else:
+                    rospy.loginfo("  HOE                         : N/A")
+                rospy.loginfo(_sep)
                 self.result_pub.publish(json.dumps({
                     "status": "success",
                     "method": "air_handover"
@@ -609,6 +627,9 @@ class SimpleGraspController:
                 return True
 
         rospy.logwarn("所有接收臂空中備案皆失敗")
+        if self.operation_start_time is not None:
+            elapsed = (rospy.Time.now() - self.operation_start_time).to_sec()
+            rospy.loginfo(f"⏱️ 夾取到任務失敗總耗時：{elapsed:.2f} 秒")
         return False
 
 
@@ -620,9 +641,7 @@ class SimpleGraspController:
         self.control_gripper(0.0, arm="left")
         rospy.sleep(0.5)
 
-        MAX_LEFT_ATTEMPTS = 3
-
-        for i, group in enumerate(left_groups[:MAX_LEFT_ATTEMPTS]):
+        for i, group in enumerate(left_groups):
             rospy.loginfo(f"左手嘗試第 #{i + 1} 組姿態")
 
             candidates = group.get('left_candidates', [])
@@ -657,7 +676,7 @@ class SimpleGraspController:
             (plan_app, frac_app) = self.left_move_group.compute_cartesian_path(
                 [pose_l_wrist_grasp], 0.01, True)
 
-            if frac_app < 0.9:
+            if frac_app < 0.5:
                 rospy.logwarn(f"左手 Approach 規劃不完整 ({frac_app:.2f})")
                 self.safe_retreat(pose_l_wrist_pre, arm="left")
                 self.go_home("left")
@@ -674,12 +693,48 @@ class SimpleGraspController:
             rospy.sleep(1.0)
             self.attach_object(object_name, arm="left")
 
-            rospy.loginfo("🎉 接收臂獨立夾取成功！")
+            rospy.loginfo("🎉 接收臂獨立夾取成功，移動到展示姿態...")
+
+            # 左手移到隨機展示姿態
+            left_carry_poses = {
+                "A": [2.2,  -0.5,  -2.2, -1.0,  1.6476,  0.3   ],
+                "B": [2.6,  -1.6,  -0.8, -0.3,  1.3,    -0.0237],
+                "C": [0.7,  -0.8,  -2.0, -0.8,  1.8,    -0.3   ],
+            }
+            carry_key = random.choice(list(left_carry_poses.keys()))
+            carry_joints = left_carry_poses[carry_key]
+            rospy.loginfo(f"左手目標姿態: {carry_key}")
+
+            self.left_move_group.set_joint_value_target(carry_joints)
+            plan_carry = self.left_move_group.plan()
+            self.left_move_group.clear_pose_targets()
+            if plan_carry[0]:
+                self.left_move_group.execute(plan_carry[1], wait=True)
+                self.left_move_group.stop()
+                rospy.loginfo(f"✅ 左手移到姿態 {carry_key}")
+            else:
+                rospy.logwarn(f"⚠️ 左手姿態 {carry_key} 規劃失敗，維持原位")
+
+            # 實驗數據摘要
+            elapsed_total = (
+                (rospy.Time.now() - self.operation_start_time).to_sec()
+                if self.operation_start_time is not None else None
+            )
+            _sep = "=" * 48
+            rospy.loginfo(_sep)
+            rospy.loginfo("[EXPERIMENT SUMMARY]")
+            if self.metric_inference_time is not None:
+                rospy.loginfo(f"  推論時間  (LLM + AnyGrasp) : {self.metric_inference_time:.2f} s")
+            if self.metric_grasp_time is not None:
+                rospy.loginfo(f"  夾取耗時                    : {self.metric_grasp_time:.2f} s")
+            if elapsed_total is not None:
+                rospy.loginfo(f"  總耗時 (觸發→完成)          : {elapsed_total:.2f} s")
+            rospy.loginfo(_sep)
+
             self.result_pub.publish(json.dumps({
                 "status": "success",
                 "method": "receiver_standalone"
             }))
-            
             return True
 
         rospy.logerr("左手獨立夾取所有方案皆失敗")
@@ -731,10 +786,11 @@ class SimpleGraspController:
         pose = np.array(result["pose"]).reshape(4, 4)
         rospy.loginfo(
             f"✓ FoundationPose pose 接收 (translation: {pose[:3,3]})")
+        self.latest_fp_pose_cam = pose
         return pose
     
     def trigger_full_detection(self, object_name, mode="dual",
-                           rotation_angle=0.0, timeout=240.0):
+                           rotation_angle=0.0, timeout=120.0):
         
         # # ── receiver_only：跳過 LLM，直接觸發 AnyGrasp ──
         # if mode == "receiver_only":
@@ -954,6 +1010,7 @@ class SimpleGraspController:
             if np.linalg.norm(current_dir) < 1e-6:
                 return 0.0
             current_dir = current_dir / np.linalg.norm(current_dir)
+            effective_target = target_dir  # functional_end：長軸對齊接收臂方向
 
         else:  # geometric
             # 找夾爪握得住（寬度 < 8.5cm）且接觸面積最大的面
@@ -978,12 +1035,16 @@ class SimpleGraspController:
             if np.linalg.norm(current_dir) < 1e-6:
                 return 0.0
             current_dir = current_dir / np.linalg.norm(current_dir)
-            if np.dot(current_dir, target_dir) < 0:
-                current_dir = -current_dir
 
-        cos_a = np.clip(np.dot(current_dir, target_dir), -1, 1)
+            # 目標：讓夾爪軸垂直於接收臂方向，使最大面朝向接收臂
+            # target_dir 的兩個垂直方向各選一個，取旋轉量最小（dot 最大）的那個
+            perp1 = np.array([-target_dir[1],  target_dir[0], 0.0])
+            perp2 = np.array([ target_dir[1], -target_dir[0], 0.0])
+            effective_target = perp1 if np.dot(current_dir, perp1) >= np.dot(current_dir, perp2) else perp2
+
+        cos_a = np.clip(np.dot(current_dir, effective_target), -1, 1)
         angle_deg = np.degrees(np.arccos(cos_a))
-        cross = np.cross(current_dir, target_dir)
+        cross = np.cross(current_dir, effective_target)
         cross_z = cross[2] if hasattr(cross, '__len__') else cross
         if cross_z < 0:
             angle_deg = -angle_deg
@@ -1072,7 +1133,7 @@ class SimpleGraspController:
         (plan, fraction) = group.compute_cartesian_path(
             [target_pose], 0.01, True)
         
-        if fraction > 0.8:
+        if fraction > 0.5:
             success = group.execute(plan, wait=True)
             group.stop()
             if success:
@@ -1083,9 +1144,144 @@ class SimpleGraspController:
         group.stop()
         return False
         
+    DEMO_LEFT_INIT_POSES = {
+        "A（高舉外展）": [2.2,  -0.5,  -2.2,  -1.0,  1.6476,  0.3],
+        "B（低伸外旋）": [2.6,  -1.6,  -0.8,  -0.3,  1.3,    -0.0237],
+        "C（內收前伸）": [0.7,  -0.8,  -2.0,  -0.8,  1.8,    -0.3],
+    }
+
+    # 各物件理想交接 yaw（世界座標，handle 朝向左臂 -Y 方向）
+    IDEAL_YAW = {
+        "hammer":              -21.5,
+        "scissors":             16.7,
+        "mug":                 -91.8,
+        "screwdriver": -117.2,
+        "spatula":             109.3,
+        "spoon":             -72.6,
+    }
+
+    # 碰撞 mesh 路徑（nontextured.stl，幾何乾淨適合碰撞計算）
+    OBJECT_MESH_MAP = {
+        "hammer":   "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/048_hammer/google_16k/nontextured.stl",
+        "scissors": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/037_scissors/google_16k/nontextured.stl",
+        "mug":                  "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/025_mug/google_16k/nontextured.stl",
+        "screwdriver": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/043_phillips_screwdriver/google_16k/nontextured.stl",
+        "sugar_box":   "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/004_sugar_box/google_16k/nontextured.stl",
+        "spatula":     "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/033_spatula/google_16k/nontextured.stl",
+        "spoon":       "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/031_spoon/google_16k/nontextured.stl",
+    }
+    COLLISION_MESH_SCALE = 0.85  # 略小於實際，補償 FP 位姿誤差
+
+    # 右手持物：整個 gripper 都接觸物件（夾住）
+    TOUCH_LINKS_RIGHT_HOLDING = [
+        "rightarm_wrist_3_link",
+        "rightarm_robotiq_85_base_link",
+        "rightarm_robotiq_85_left_finger_link",
+        "rightarm_robotiq_85_left_finger_tip_link",
+        "rightarm_robotiq_85_left_inner_knuckle_link",
+        "rightarm_robotiq_85_left_knuckle_link",
+        "rightarm_robotiq_85_right_finger_link",
+        "rightarm_robotiq_85_right_finger_tip_link",
+        "rightarm_robotiq_85_right_inner_knuckle_link",
+        "rightarm_robotiq_85_right_knuckle_link",
+    ]
+    # 左手接收：只豁免指尖（讓 base/finger body 仍受碰撞限制，强迫繞路）
+    TOUCH_LINKS_LEFT_RECEIVING = [
+        "leftarm_robotiq_85_left_finger_tip_link",
+        "leftarm_robotiq_85_right_finger_tip_link",
+    ]
+    TOUCH_LINKS_FOR_HELD_OBJECT = TOUCH_LINKS_RIGHT_HOLDING + TOUCH_LINKS_LEFT_RECEIVING
+
+    def _wait_for_scene_update(self, col_name, expect_attached, timeout=5.0):
+        """輪詢 MoveIt 規劃場景直到更新確認，避免非同步延遲導致規劃時場景未更新。"""
+        deadline = rospy.Time.now() + rospy.Duration(timeout)
+        while rospy.Time.now() < deadline:
+            attached = self.scene.get_attached_objects([col_name])
+            known   = self.scene.get_known_object_names()
+            if expect_attached and col_name in attached:
+                return True
+            if not expect_attached and col_name not in known and col_name not in attached:
+                return True
+            rospy.sleep(0.1)
+        return False
+
+    def _attach_collision_mesh(self, object_name):
+        """把物件 mesh 加入 MoveIt 場景並 attach 到右手 wrist，讓接收臂規劃時知道要閃它。"""
+        mesh_path = self.OBJECT_MESH_MAP.get(object_name)
+        if not mesh_path or not os.path.exists(mesh_path):
+            rospy.logwarn(f"[collision mesh] 找不到 {object_name} 的 mesh，跳過")
+            return False
+        if self.latest_fp_pose_cam is None:
+            rospy.logwarn("[collision mesh] 沒有 FoundationPose 估測結果，跳過")
+            return False
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                "world", "camera_color_optical_frame", rospy.Time(0), rospy.Duration(2.0))
+            t, q = trans.transform.translation, trans.transform.rotation
+            T_wc = quaternion_matrix([q.x, q.y, q.z, q.w])
+            T_wc[:3, 3] = [t.x, t.y, t.z]
+            T_wo = T_wc @ self.latest_fp_pose_cam
+
+            ps = PoseStamped()
+            ps.header.frame_id = "world"
+            ps.header.stamp = rospy.Time.now()
+            ps.pose.position.x = T_wo[0, 3]
+            ps.pose.position.y = T_wo[1, 3]
+            ps.pose.position.z = T_wo[2, 3]
+            qo = quaternion_from_matrix(T_wo)
+            ps.pose.orientation.x = qo[0]
+            ps.pose.orientation.y = qo[1]
+            ps.pose.orientation.z = qo[2]
+            ps.pose.orientation.w = qo[3]
+
+            col_name = object_name + "_col"
+            rospy.loginfo(
+                f"[collision mesh] 物件世界座標: "
+                f"({T_wo[0,3]:.3f}, {T_wo[1,3]:.3f}, {T_wo[2,3]:.3f})")
+
+            s = self.COLLISION_MESH_SCALE
+            self.scene.add_mesh(col_name, ps, mesh_path, size=(s, s, s))
+            if not self._wait_for_scene_update(col_name, expect_attached=False):
+                rospy.logwarn("[collision mesh] add_mesh 場景更新超時")
+
+            self.scene.attach_object(col_name, "rightarm_wrist_3_link",
+                                     touch_links=self.TOUCH_LINKS_FOR_HELD_OBJECT)
+            if not self._wait_for_scene_update(col_name, expect_attached=True):
+                rospy.logwarn("[collision mesh] attach_object 場景更新超時，規劃可能不含物件碰撞")
+                return False
+
+            rospy.loginfo(
+                f"[collision mesh] ✅ {col_name} 已確認 attach 到右手"
+                f"（touch_links: right gripper all + left fingertip only）")
+            return True
+        except Exception as e:
+            rospy.logwarn(f"[collision mesh] attach 失敗: {e}")
+            return False
+
+    def _remove_collision_mesh(self, object_name):
+        """從 MoveIt 場景移除物件碰撞 mesh。"""
+        col_name = object_name + "_col"
+        try:
+            self.scene.remove_attached_object("rightarm_wrist_3_link", name=col_name)
+            self.scene.remove_world_object(col_name)
+            self._wait_for_scene_update(col_name, expect_attached=False)
+            rospy.loginfo(f"[collision mesh] ✅ {col_name} 已確認從規劃場景移除")
+        except Exception as e:
+            rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
+
     def execute_mission(self):
-        TARGET_OBJECT_NAME = "hammer"
-        
+        TARGET_OBJECT_NAME = "spatula"
+
+        # 重置每次實驗的 metrics 與狀態
+        self.metric_mission_start  = rospy.Time.now()
+        self.metric_inference_time = None
+        self.metric_grasp_time     = None
+        self.metric_rotation_angle = None
+        self.metric_hoe_value      = None
+        self.metric_hoe_label      = None
+        self.latest_fp_pose_cam    = None
+        self._remove_collision_mesh(TARGET_OBJECT_NAME)  # 清除上次殘留
+
         # =========================================================
         # 階段一：視覺偵測，取得右手夾取姿態
         # =========================================================
@@ -1093,6 +1289,7 @@ class SimpleGraspController:
         if ranked_groups is None:
             rospy.logerr("初始偵測失敗，任務中止")
             return
+        self.metric_inference_time = (rospy.Time.now() - self.metric_mission_start).to_sec()
 
         # =========================================================
         # 階段二：右手夾取（開環，只試一次右手姿態）
@@ -1103,9 +1300,11 @@ class SimpleGraspController:
         pose_fingertip_final = None
         pose_wrist_pre_final = None
         pose_right_target_final = None
+        pre_grasp_yaw_deg = None
 
         MAX_RIGHT_ATTEMPTS = 8  # 最多試 3 組右手姿態
-        
+        self.operation_start_time = rospy.Time.now()
+
         for i, group in enumerate(ranked_groups[:MAX_RIGHT_ATTEMPTS]):
             rospy.loginfo(f"右手嘗試第 #{i+1} 組姿態")
             
@@ -1159,7 +1358,7 @@ class SimpleGraspController:
             # Approach
             (plan_app, fraction) = self.move_group.compute_cartesian_path(
                 [pose_wrist_grasp], 0.01, True)
-            if fraction < 0.9 or not self.move_group.execute(plan_app, wait=True):
+            if fraction < 0.5 or not self.move_group.execute(plan_app, wait=True):
                 self.move_group.stop()
                 self.safe_retreat(pose_wrist_grasp, arm="right")
                 self.go_home("right")
@@ -1196,7 +1395,7 @@ class SimpleGraspController:
             self.control_gripper(0.1)
             rospy.sleep(1.0)
             self.attach_object(TARGET_OBJECT_NAME, arm="right")
-            
+
             # 記錄實際夾爪位置，算物件中心相對夾爪的偏移
             try:
                 trans_grip = self.tf_buffer.lookup_transform(
@@ -1235,6 +1434,8 @@ class SimpleGraspController:
             pose_wrist_grasp_final = pose_wrist_grasp
             pose_fingertip_final = pose_fingertip
             pose_wrist_pre_final = pose_wrist_pre
+            if self.operation_start_time is not None:
+                self.metric_grasp_time = (rospy.Time.now() - self.operation_start_time).to_sec()
             break
 
         if not grasp_success:
@@ -1271,7 +1472,21 @@ class SimpleGraspController:
             receiver_base,
             object_pos
         )
-        
+
+        # 記錄旋轉前的 Gazebo yaw（供非功能端量測：基準 = pre_yaw + rotation_angle）
+        try:
+            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+            _gs = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+            _r = _gs(TARGET_OBJECT_NAME, 'world')
+            _q = _r.pose.orientation
+            _siny = 2.0 * (_q.w * _q.z + _q.x * _q.y)
+            _cosy = 1.0 - 2.0 * (_q.y * _q.y + _q.z * _q.z)
+            pre_grasp_yaw_deg = math.degrees(math.atan2(_siny, _cosy))
+            self.metric_rotation_angle = rotation_angle
+            rospy.loginfo(f"[HOE] pre-grasp yaw={pre_grasp_yaw_deg:.1f}°  rot={rotation_angle:.1f}°")
+        except Exception as _e:
+            rospy.logwarn(f"[HOE] 無法取得旋轉前 yaw: {_e}")
+
         # 先旋轉（原地）
         if abs(rotation_angle) > 5.0:
             rospy.loginfo(f"執行手腕旋轉 {rotation_angle:.1f}°...")
@@ -1292,15 +1507,24 @@ class SimpleGraspController:
         HANDOVER_POSITION = self.calculate_handover_position(
             pose_wrist_grasp_final, current_pose_after_rotation)
 
-        # 規劃右手軌跡
+        # 規劃右手軌跡（先試 cartesian path，失敗則 fallback 到 joint space）
         (plan_handover, frac_handover) = self.move_group.compute_cartesian_path(
             [HANDOVER_POSITION], 0.01, True)
         if frac_handover < 0.9:
-            rospy.logwarn("移動到交接區失敗，放下物件")
-            self.control_gripper(0.0)
-            self.detach_object(TARGET_OBJECT_NAME, arm="right")
-            self.go_home("right")
-            return
+            rospy.logwarn("⚠️ cartesian path 失敗，改用 joint space 規劃...")
+            self.move_group.set_pose_target(HANDOVER_POSITION)
+            plan_result = self.move_group.plan()
+            self.move_group.clear_pose_targets()
+            if plan_result[0]:
+                plan_handover = plan_result[1]
+                frac_handover = 1.0
+                rospy.loginfo("✅ joint space fallback 規劃成功")
+            else:
+                rospy.logwarn("移動到交接區失敗，放下物件")
+                self.control_gripper(0.0)
+                self.detach_object(TARGET_OBJECT_NAME, arm="right")
+                self.go_home("right")
+                return
 
         # 規劃左手到待命位置的軌跡
         self.left_move_group.set_joint_value_target(self.left_standby_joints)
@@ -1350,16 +1574,63 @@ class SimpleGraspController:
         self.left_move_group.stop()
 
         # =========================================================
+        # 量測：比較實際物件 yaw 與理想 yaw
+        # =========================================================
+        try:
+            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+            get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+            resp = get_model_state(TARGET_OBJECT_NAME, 'world')
+            q = resp.pose.orientation
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            actual_yaw_deg = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+
+            if TARGET_OBJECT_NAME in self.IDEAL_YAW:
+                ideal_yaw_deg = self.IDEAL_YAW[TARGET_OBJECT_NAME]
+                error_deg = (actual_yaw_deg - ideal_yaw_deg + 180.0) % 360.0 - 180.0
+                self.metric_hoe_value = error_deg
+                self.metric_hoe_label = "HOE_func"
+                rospy.loginfo(
+                    f"[HOE] {TARGET_OBJECT_NAME} (functional): "
+                    f"actual={actual_yaw_deg:.1f}°  ideal={ideal_yaw_deg:.1f}°  "
+                    f"HOE_func={error_deg:+.1f}°"
+                )
+            elif pre_grasp_yaw_deg is not None:
+                target_yaw_deg = (pre_grasp_yaw_deg + rotation_angle + 180.0) % 360.0 - 180.0
+                error_deg = (actual_yaw_deg - target_yaw_deg + 180.0) % 360.0 - 180.0
+                self.metric_hoe_value = error_deg
+                self.metric_hoe_label = "HOE_exec"
+                rospy.loginfo(
+                    f"[HOE] {TARGET_OBJECT_NAME} (non-functional): "
+                    f"actual={actual_yaw_deg:.1f}°  target={target_yaw_deg:.1f}°  "
+                    f"HOE_exec={error_deg:+.1f}°  "
+                    f"(pre={pre_grasp_yaw_deg:.1f}° + rot={rotation_angle:.1f}°)"
+                )
+            else:
+                rospy.loginfo(
+                    f"[HOE] {TARGET_OBJECT_NAME}: actual={actual_yaw_deg:.1f}° (no reference available)"
+                )
+        except Exception as e:
+            rospy.logwarn(f"[HOE] 無法查詢 Gazebo 物件姿態: {e}")
+
+        # =========================================================
         # 階段四：觸發 receiver_only 重偵測，確認旋轉後的接取姿態
         # =========================================================
         rospy.loginfo("到達交接區，觸發 receiver_only 重偵測...")
+        _t_recv_infer = rospy.Time.now()
         receiver_groups = self.trigger_full_detection(
             TARGET_OBJECT_NAME,
             mode="receiver_only",
             rotation_angle=rotation_angle)
+        _recv_infer_elapsed = (rospy.Time.now() - _t_recv_infer).to_sec()
+        if self.metric_inference_time is not None:
+            self.metric_inference_time += _recv_infer_elapsed
+        else:
+            self.metric_inference_time = _recv_infer_elapsed
 
         if receiver_groups is not None and len(receiver_groups) > 0:
             rospy.loginfo("receiver_only 偵測成功，嘗試空中交接")
+            self._attach_collision_mesh(TARGET_OBJECT_NAME)
             success = self.execute_air_handover(
                 receiver_groups,
                 TARGET_OBJECT_NAME,
@@ -1390,6 +1661,7 @@ class SimpleGraspController:
         (plan_down, frac_down) = self.move_group.compute_cartesian_path(
             [pose_put_down], 0.01, True)
         
+        self._remove_collision_mesh(TARGET_OBJECT_NAME)
         if frac_down > 0.5:
             self.move_group.execute(plan_down, wait=True)
             self.move_group.stop()
@@ -1407,8 +1679,14 @@ class SimpleGraspController:
 
         rospy.loginfo("右手已退開，觸發左手重新偵測")
         
-        rospy.loginfo("重新觸發 dual 偵測，讓接收臂重新規劃")
-        left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="dual")
+        rospy.loginfo("重新觸發 left_only 偵測，讓左手從桌面重新夾取")
+        _t_left_infer = rospy.Time.now()
+        left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_only")
+        _left_infer_elapsed = (rospy.Time.now() - _t_left_infer).to_sec()
+        if self.metric_inference_time is not None:
+            self.metric_inference_time += _left_infer_elapsed
+        else:
+            self.metric_inference_time = _left_infer_elapsed
         if left_groups is None:
             rospy.logerr("接收臂重新偵測失敗，任務中止")
             return

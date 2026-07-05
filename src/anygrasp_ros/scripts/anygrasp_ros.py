@@ -3,10 +3,17 @@
 
 import sys
 import os
+import io
+import queue
 import cv2
 import json
 import threading
 import open3d as o3d
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 ros_path = '/opt/ros/noetic/lib/python3/dist-packages'
 if ros_path in sys.path:
@@ -19,11 +26,13 @@ try:
     from sensor_msgs.msg import Image
     from std_msgs.msg import String
     from geometry_msgs.msg import Pose
+    from visualization_msgs.msg import Marker, MarkerArray
     import tf2_ros
     print("✅ 成功跨界連接 ROS Noetic！")
 except ImportError:
     print("❌ 找不到 ROS")
 
+import torch
 import numpy as np
 from scipy.spatial.transform import Rotation
 from scipy.spatial import cKDTree
@@ -53,11 +62,8 @@ class Config:
         self.max_gripper_width = 0.085
         self.gripper_height = 0.04
         self.top_down_grasp = False
-        self.debug = False  
-        # 開環模式關閉 debug 視覺化
-        # 從環境變數讀取，預設開啟 debug
-        # 正式執行時在終端機下 export ANYGRASP_DEBUG=0 關閉
-        self.debug = os.environ.get("ANYGRASP_DEBUG", "1") == "1"
+        # 視覺化開關：要開啟時改成 True
+        self.debug = False
 
 
 class AnyGraspHandoverNode:
@@ -90,6 +96,8 @@ class AnyGraspHandoverNode:
 
         self.plan_pub = rospy.Publisher(
             "/anygrasp/handover_plan", String, queue_size=1)
+        self.grasp_marker_pub = rospy.Publisher(
+            "/anygrasp/grasp_markers", MarkerArray, queue_size=1, latch=True)
 
         self.need_detection = False
         self.target_object = "unknown_object"
@@ -139,7 +147,91 @@ class AnyGraspHandoverNode:
         # FoundationPose 給的物件 pose (camera frame, 4x4)
         self.object_pose_in_cam = None
 
+        # debug 視覺化：matplotlib Agg（純 CPU，不碰 OpenGL/GLFW）→ cv2 視窗
+        # 第一階段（dual）左下角，第二階段（FP補全）右下角
+        self._cv_queue = queue.Queue()
+        if self.cfgs.debug:
+            self._cv_thread = threading.Thread(
+                target=self._cv_display_worker, daemon=True)
+            self._cv_thread.start()
+
         rospy.loginfo("🤖 AnyGrasp 節點就緒，等待觸發...")
+
+    def _cv_display_worker(self):
+        """啟動時就建好兩個視窗（左/右），之後只做 imshow 更新，不再新增視窗。"""
+        W, H = 700, 520
+        blank = np.zeros((H, W, 3), dtype=np.uint8)
+        left_name  = "AnyGrasp 給予臂"
+        right_name = "AnyGrasp 接收臂(FP補全)"
+        for name in (left_name, right_name):
+            cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(name, W, H)
+            cv2.imshow(name, blank)
+        cv2.moveWindow(left_name,  0,   550)
+        cv2.moveWindow(right_name, 720, 550)
+        cv2.waitKey(1)
+        while not rospy.is_shutdown():
+            try:
+                window_name, img_bgr = self._cv_queue.get(timeout=0.05)
+                cv2.imshow(window_name, img_bgr)
+            except queue.Empty:
+                pass
+            cv2.waitKey(1)
+
+    def _show_as_cv_window(self, geom_list, window_name, width=700, height=520):
+        """背景執行緒用 matplotlib Agg 渲染（無 OpenGL/GLFW），送給 cv2 視窗。"""
+        def _work():
+            try:
+                fig = Figure(figsize=(width / 100, height / 100), dpi=100)
+                canvas = FigureCanvasAgg(fig)
+                ax = fig.add_subplot(111, projection='3d')
+                for g in geom_list:
+                    if isinstance(g, o3d.geometry.PointCloud):
+                        pts = np.asarray(g.points)
+                        if len(pts) == 0:
+                            continue
+                        cols = np.clip(np.asarray(g.colors), 0, 1) \
+                            if g.has_colors() else np.full((len(pts), 3), 0.6)
+                        if len(pts) > 4000:
+                            idx = np.random.choice(len(pts), 4000, replace=False)
+                            pts, cols = pts[idx], cols[idx]
+                        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                                   c=cols, s=1, alpha=0.7, linewidths=0)
+                    elif isinstance(g, o3d.geometry.TriangleMesh):
+                        verts = np.asarray(g.vertices)
+                        tris  = np.asarray(g.triangles)
+                        if len(verts) == 0 or len(tris) == 0:
+                            continue
+                        if g.has_vertex_colors():
+                            col = np.mean(np.asarray(g.vertex_colors), axis=0)
+                        else:
+                            col = [0.2, 0.6, 1.0]
+                        if len(tris) > 300:
+                            tris = tris[np.random.choice(
+                                len(tris), 300, replace=False)]
+                        pc = Poly3DCollection(verts[tris], alpha=0.5,
+                                              facecolor=col, edgecolor='none')
+                        ax.add_collection3d(pc)
+                    elif isinstance(g, o3d.geometry.LineSet):
+                        pts   = np.asarray(g.points)
+                        lines = np.asarray(g.lines)
+                        cols  = np.asarray(g.colors) if g.has_colors() \
+                            else np.full((len(lines), 3), 0.2)
+                        for ln, c in zip(lines, cols):
+                            ax.plot([pts[ln[0], 0], pts[ln[1], 0]],
+                                    [pts[ln[0], 1], pts[ln[1], 1]],
+                                    [pts[ln[0], 2], pts[ln[1], 2]],
+                                    color=c, linewidth=1)
+                ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+                fig.tight_layout()
+                canvas.draw()
+                buf = canvas.buffer_rgba()
+                img_rgba = np.asarray(buf, dtype=np.uint8)
+                img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
+                self._cv_queue.put((window_name, img_bgr))
+            except Exception as e:
+                rospy.logwarn(f"[Debug] 渲染失敗: {e}")
+        threading.Thread(target=_work, daemon=True).start()
 
     def trigger_callback(self, msg):
         try:
@@ -177,6 +269,77 @@ class AnyGraspHandoverNode:
         q = Rotation.from_matrix(grasp.rotation_matrix).as_quat()
         p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = q
         return p
+
+    def publish_grasp_markers(self, arm_grasps, frame_id):
+        """將 arm_grasps（get_arm_specific_grasps 輸出）發布為 RViz MarkerArray。
+        箭頭 = 接近方向，球 = 夾取中心；按排名從綠（最佳）到紅漸變。"""
+        ma = MarkerArray()
+        n = len(arm_grasps)
+        now = rospy.Time.now()
+
+        # 先清除上一次的 markers
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        clear.ns = "grasp_candidates"
+        ma.markers.append(clear)
+
+        for rank, item in enumerate(arm_grasps):
+            g = item['grasp']
+            t = g.translation
+            R = g.rotation_matrix
+            approach = R[:, 0]  # AnyGrasp 接近方向
+
+            ratio = rank / max(n - 1, 1)  # 0=最佳(綠) → 1=最差(紅)
+            r_col, g_col = float(ratio), float(1.0 - ratio)
+
+            # 箭頭 marker（接近方向）
+            arrow = Marker()
+            arrow.header.frame_id = frame_id
+            arrow.header.stamp = now
+            arrow.ns = "grasp_candidates"
+            arrow.id = rank * 2
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.position.x = float(t[0])
+            arrow.pose.position.y = float(t[1])
+            arrow.pose.position.z = float(t[2])
+            q = Rotation.from_matrix(R).as_quat()
+            arrow.pose.orientation.x = float(q[0])
+            arrow.pose.orientation.y = float(q[1])
+            arrow.pose.orientation.z = float(q[2])
+            arrow.pose.orientation.w = float(q[3])
+            arrow.scale.x = 0.06  # 箭頭長
+            arrow.scale.y = 0.008
+            arrow.scale.z = 0.008
+            arrow.color.r = r_col
+            arrow.color.g = g_col
+            arrow.color.b = 0.0
+            arrow.color.a = 0.85
+            arrow.lifetime = rospy.Duration(0)
+            ma.markers.append(arrow)
+
+            # 球 marker（夾取位置）
+            sphere = Marker()
+            sphere.header.frame_id = frame_id
+            sphere.header.stamp = now
+            sphere.ns = "grasp_candidates"
+            sphere.id = rank * 2 + 1
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = float(t[0])
+            sphere.pose.position.y = float(t[1])
+            sphere.pose.position.z = float(t[2])
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.015
+            sphere.color.r = r_col
+            sphere.color.g = g_col
+            sphere.color.b = 0.0
+            sphere.color.a = 1.0
+            sphere.lifetime = rospy.Duration(0)
+            ma.markers.append(sphere)
+
+        self.grasp_marker_pub.publish(ma)
+        rospy.loginfo(f"[viz] 發布 {n} 個夾取姿態 markers → /anygrasp/grasp_markers")
 
     def pose_to_dict(self, pose):
         return {
@@ -615,11 +778,8 @@ class AnyGraspHandoverNode:
                         recv_vis.transform(trans_mat)
                         vis_list.append(recv_vis)
 
-                threading.Thread(
-                    target=lambda: o3d.visualization.draw_geometries(
-                        vis_list,
-                        window_name="ICP 補全對齊確認"),
-                    daemon=True).start()
+                self._show_as_cv_window(vis_list, "AnyGrasp 給予臂")
+                rospy.loginfo("👀 [Debug] ICP 補全確認（左下角視窗）")
     
             rospy.loginfo(
                 f"✅ 補全完成: {len(pts_clean)} → {len(completed)} 點")
@@ -746,11 +906,8 @@ class AnyGraspHandoverNode:
                         recv_vis.transform(trans_mat)
                         vis_list.append(recv_vis)
 
-                threading.Thread(
-                    target=lambda: o3d.visualization.draw_geometries(
-                        vis_list,
-                        window_name="RANSAC+ICP 補全對齊確認"),
-                    daemon=True).start()
+                self._show_as_cv_window(vis_list, "AnyGrasp 給予臂")
+                rospy.loginfo("👀 [Debug] RANSAC+ICP 補全確認（左下角視窗）")
 
             rospy.loginfo(
                 f"✅ 補全完成: {len(pts_clean)} → {len(completed)} 點")
@@ -1151,6 +1308,7 @@ class AnyGraspHandoverNode:
                     apply_object_mask=False,
                     dense_grasp=True,
                     collision_detection=True)
+                torch.cuda.empty_cache()
 
                 if gg_recv is None or len(gg_recv) == 0:
                     rospy.logwarn("⚠️ receiver_only 找不到姿態")
@@ -1161,8 +1319,9 @@ class AnyGraspHandoverNode:
                 gg_recv = gg_recv.nms().sort_by_score()[:top_k]
                 recv_filtered = self.get_arm_specific_grasps(
                     gg_recv, "leftarm", camera_frame)
+                self.publish_grasp_markers(recv_filtered, camera_frame)
                 json_plan = self.generate_left_only_plan(recv_filtered)
-                
+
                 if json_plan:
                     self.plan_pub.publish(json.dumps(json_plan))
                     rospy.loginfo(
@@ -1190,14 +1349,73 @@ class AnyGraspHandoverNode:
                             g.transform(trans_mat)
                             g.paint_uniform_color([0, 0, 1])
                             vis_list.append(g)
-                        threading.Thread(
-                            target=lambda: o3d.visualization.draw_geometries(
-                                vis_list,
-                                window_name="灰=完整mesh 紅=receiver區 藍=姿態"),
-                            daemon=True).start()
+                        self._show_as_cv_window(
+                            vis_list, "AnyGrasp 接收臂(FP補全)")
+                        rospy.loginfo("👀 [Debug] FP補全夾取姿態（右下角視窗）")
                         
                 else:
                     rospy.logwarn("❌ receiver_only 找不到有效姿態")
+                    self.plan_pub.publish(json.dumps([]))
+                return
+
+            if mode == "left_only":
+                rospy.loginfo("🧠 left_only：用 receiver_mask 直接在桌面偵測左手夾取姿態")
+
+                if not os.path.exists(receiver_mask_path):
+                    rospy.logerr("❌ 找不到 receiver_mask（left_only 需要 LLM 先完成）")
+                    self.plan_pub.publish(json.dumps([]))
+                    return
+
+                mask_recv_img = cv2.imread(receiver_mask_path, cv2.IMREAD_GRAYSCALE)
+                mask_recv = cv2.resize(
+                    mask_recv_img, (color_np.shape[1], color_np.shape[0])) > 127
+                pts_recv = np.stack(
+                    [points_x, points_y, points_z],
+                    axis=-1)[valid_depth_mask & mask_recv].astype(np.float32)
+                pts_recv = self.filter_outlier_points(pts_recv)
+
+                if pts_recv.shape[0] < 50:
+                    rospy.logwarn("⚠️ left_only：遮罩內點雲過少，中止")
+                    self.plan_pub.publish(json.dumps([]))
+                    return
+
+                _thin_pad_lo = 0.03 if self.target_object in {"scissors", "screwdriver", "spatula", "spoon"} else 0.0
+                lims_recv = self.get_dynamic_lims(pts_recv, pad=_thin_pad_lo)
+                if not lims_recv:
+                    rospy.logwarn("⚠️ left_only：無法計算 lims")
+                    self.plan_pub.publish(json.dumps([]))
+                    return
+
+                rospy.loginfo(
+                    f"[DEBUG] left_only 餵 AnyGrasp: "
+                    f"pts={pts_recv.shape[0]}, lims={lims_recv}")
+
+                gg_recv, _ = self.anygrasp.get_grasp(
+                    points_full, colors_full,
+                    lims=lims_recv,
+                    apply_object_mask=False,
+                    dense_grasp=True,
+                    collision_detection=True)
+                torch.cuda.empty_cache()
+
+                if gg_recv is None or len(gg_recv) == 0:
+                    rospy.logwarn("⚠️ left_only 找不到姿態")
+                    self.plan_pub.publish(json.dumps([]))
+                    return
+
+                top_k = 20
+                gg_recv = gg_recv.nms().sort_by_score()[:top_k]
+                recv_filtered = self.get_arm_specific_grasps(
+                    gg_recv, "leftarm", camera_frame)
+                self.publish_grasp_markers(recv_filtered, camera_frame)
+                json_plan = self.generate_left_only_plan(recv_filtered)
+
+                if json_plan:
+                    self.plan_pub.publish(json.dumps(json_plan))
+                    rospy.loginfo(
+                        f"✅ left_only 計畫書發布，共 {len(json_plan)} 個姿態")
+                else:
+                    rospy.logwarn("❌ left_only 找不到有效姿態")
                     self.plan_pub.publish(json.dumps([]))
                 return
 
@@ -1208,7 +1426,9 @@ class AnyGraspHandoverNode:
                 [points_x, points_y, points_z],
                 axis=-1)[valid_depth_mask & mask_recv].astype(np.float32)
             pts_recv = self.filter_outlier_points(pts_recv)
-            lims_recv = self.get_dynamic_lims(pts_recv, pad=0.0)
+            _thin_objects = {"scissors", "screwdriver", "spatula", "spoon"}
+            _thin_pad = 0.03 if self.target_object in _thin_objects else 0.0
+            lims_recv = self.get_dynamic_lims(pts_recv, pad=_thin_pad)
 
             # =========================================================
             # dual 模式：生成左右手姿態並配對
@@ -1220,7 +1440,7 @@ class AnyGraspHandoverNode:
                 [points_x, points_y, points_z],
                 axis=-1)[valid_depth_mask & mask_giver].astype(np.float32)
             pts_giver = self.filter_outlier_points(pts_giver)
-            lims_giver = self.get_dynamic_lims(pts_giver, pad=0.0)
+            lims_giver = self.get_dynamic_lims(pts_giver, pad=_thin_pad)
 
             if not lims_giver:
                 rospy.logwarn("⚠️ 操作臂遮罩內缺乏有效點雲")
@@ -1234,6 +1454,7 @@ class AnyGraspHandoverNode:
                 apply_object_mask=False,
                 dense_grasp=True,
                 collision_detection=True)
+            torch.cuda.empty_cache()
 
             if gg_giver is None or len(gg_giver) == 0:
                 rospy.logwarn("⚠️ 無法找到操作臂姿態")
@@ -1327,7 +1548,6 @@ class AnyGraspHandoverNode:
                     "object_centroid": oc_world 
                 }))
                 
-                # ↓ 在這裡加入 debug 視覺化
                 if self.cfgs.debug:
                     trans_mat = np.array([[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1]])
                     cloud = o3d.geometry.PointCloud()
@@ -1340,10 +1560,8 @@ class AnyGraspHandoverNode:
                         gripper.transform(trans_mat)
                         gripper.paint_uniform_color([1, 0, 0])
                         vis_list.append(gripper)
-                    threading.Thread(
-                        target=lambda: o3d.visualization.draw_geometries(vis_list),
-                        daemon=True).start()
-                    rospy.loginfo("👀 [Debug] 視覺化視窗已在背景開啟")
+                    self._show_as_cv_window(vis_list, "AnyGrasp 給予臂")
+                    rospy.loginfo("👀 [Debug] 給予臂夾取姿態（左下角視窗）")
             else:
                 rospy.logwarn("❌ dual 模式找不到可行方案")
                 self.plan_pub.publish(json.dumps([]))

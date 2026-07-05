@@ -20,6 +20,7 @@
           <mesh>
             <!-- Use a downsampled mesh for collisions -->
             <uri>model://037_scissors/google_16k/textured.obj</uri>
+            <scale>1 1 2</scale>
 	        </mesh>
         </geometry>
         <surface>
@@ -35,6 +36,7 @@
         <geometry>
           <mesh>
             <uri>model://037_scissors/google_16k/textured.obj</uri>
+            <scale>1 1 2</scale>
 	        </mesh>
         </geometry>
         <material>

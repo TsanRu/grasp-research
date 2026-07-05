@@ -15,6 +15,7 @@ sys.path.append(ros_path)
 import rospy
 import message_filters
 from sensor_msgs.msg import Image
+import torch
 import numpy as np
 import open3d as o3d
 from scipy.spatial.transform import Rotation
@@ -68,6 +69,9 @@ class AnyGraspNode:
         
         # 您的工作空間設定 (可以在這裡隨時微調)
         self.lims = [-0.2, 0.25, -0.2, 0.6, 0.4, 0.8]
+
+        self.target_object = rospy.get_param('~object_name', 'unknown')
+        self.THIN_OBJECTS = {"scissors", "screwdriver"}
 
         rospy.loginfo("Loading AnyGrasp Model...")
         self.anygrasp = AnyGrasp(self.cfgs)
@@ -187,10 +191,25 @@ class AnyGraspNode:
             # ==========================================
 
             # --- 3. 執行偵測 ---
+            _is_thin = self.target_object in self.THIN_OBJECTS
+            if _is_thin:
+                _pad = 0.03
+                min_b = points.min(axis=0)
+                max_b = points.max(axis=0)
+                _lims = [
+                    min_b[0] - _pad, max_b[0] + _pad,
+                    min_b[1] - 0.05, max_b[1] + _pad,
+                    min_b[2] - _pad, max_b[2] + _pad,
+                ]
+                rospy.loginfo(f"[thin object] {self.target_object}：動態 lims + pad={_pad}")
+            else:
+                _lims = self.lims
             gg, cloud = self.anygrasp.get_grasp(
-                points, colors, lims=self.lims, 
-                apply_object_mask=True, dense_grasp=True, collision_detection=True
+                points, colors, lims=_lims,
+                apply_object_mask=not _is_thin, dense_grasp=True, collision_detection=True
             )
+
+            torch.cuda.empty_cache()
 
             # 【防呆修改】 加入 gg is None 防止空值崩潰
             if gg is None or len(gg) == 0:
@@ -282,6 +301,7 @@ class AnyGraspNode:
                 visualization_list = [cloud, bbox_lines] + top_k_grippers
 
                 o3d.visualization.draw_geometries(visualization_list)
+                rospy.signal_shutdown("visualization done")
 
         except Exception as e:
             rospy.logerr(f"Error: {e}")
