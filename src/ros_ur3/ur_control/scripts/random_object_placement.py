@@ -163,28 +163,46 @@ OBJECT_INIT_ROLL_DEG = {
     "sugar_box":   90.0,   # 將第二大面朝下（側臥）
 }
 
+OBJECT_SPAWN_OFFSET = {
+    "tomato_soup_can": 0.02,   # 輕量圓罐，落距太大容易倒
+}
+
 def yaw_to_quaternion(yaw: float) -> Quaternion:
     return Quaternion(x=0.0, y=0.0,
                       z=math.sin(yaw / 2),
                       w=math.cos(yaw / 2))
 
+_override_roll_deg  = None  # 由命令列 --roll 暫時設定
+_override_pitch_deg = None  # 由命令列 --pitch 暫時設定
+
 def get_placement_quaternion(model_name: str, yaw: float) -> Quaternion:
-    """回傳考慮初始 roll 後再疊加 yaw 的四元數。"""
-    roll_deg = OBJECT_INIT_ROLL_DEG.get(model_name, 0.0)
-    if roll_deg == 0.0:
-        return yaw_to_quaternion(yaw)
-    # q_roll：繞 X 軸旋轉 roll_deg
-    r = math.radians(roll_deg) / 2.0
-    qr_w, qr_x, qr_y, qr_z = math.cos(r), math.sin(r), 0.0, 0.0
-    # q_yaw：繞 Z 軸旋轉 yaw
-    h = yaw / 2.0
-    qy_w, qy_x, qy_y, qy_z = math.cos(h), 0.0, 0.0, math.sin(h)
-    # q_total = q_yaw * q_roll（先 roll 再 yaw）
-    w = qy_w*qr_w - qy_x*qr_x - qy_y*qr_y - qy_z*qr_z
-    x = qy_w*qr_x + qy_x*qr_w + qy_y*qr_z - qy_z*qr_y
-    y = qy_w*qr_y - qy_x*qr_z + qy_y*qr_w + qy_z*qr_x
-    z = qy_w*qr_z + qy_x*qr_y - qy_y*qr_x + qy_z*qr_w
-    return Quaternion(x=x, y=y, z=z, w=w)
+    """回傳考慮初始 roll/pitch 後再疊加 yaw 的四元數。順序：先 pitch(Y)，再 roll(X)，再 yaw(Z)。"""
+    roll_deg  = _override_roll_deg  if _override_roll_deg  is not None \
+        else OBJECT_INIT_ROLL_DEG.get(model_name, 0.0)
+    pitch_deg = _override_pitch_deg if _override_pitch_deg is not None else 0.0
+
+    def axis_quat(angle_deg, axis):
+        a = math.radians(angle_deg) / 2.0
+        c, s = math.cos(a), math.sin(a)
+        if axis == 'x': return (c, s, 0.0, 0.0)
+        if axis == 'y': return (c, 0.0, s, 0.0)
+        if axis == 'z': return (c, 0.0, 0.0, s)
+
+    def qmul(a, b):
+        aw, ax, ay, az = a
+        bw, bx, by, bz = b
+        return (aw*bw - ax*bx - ay*by - az*bz,
+                aw*bx + ax*bw + ay*bz - az*by,
+                aw*by - ax*bz + ay*bw + az*bx,
+                aw*bz + ax*by - ay*bx + az*bw)
+
+    q = (1.0, 0.0, 0.0, 0.0)
+    if pitch_deg != 0.0:
+        q = qmul(q, axis_quat(pitch_deg, 'y'))
+    if roll_deg != 0.0:
+        q = qmul(q, axis_quat(roll_deg, 'x'))
+    q = qmul(axis_quat(math.degrees(yaw), 'z'), q)
+    return Quaternion(x=q[1], y=q[2], z=q[3], w=q[0])
 
 
 def model_exists(model_name: str) -> bool:
@@ -306,7 +324,8 @@ def remove_object(model_name: str) -> bool:
 
 def random_place(model_name: str, seed: int = None,
                  settle_wait: float = 1.5,
-                 fixed_yaw_deg: float = None) -> tuple:
+                 fixed_yaw_deg: float = None,
+                 fixed_x: float = None, fixed_y: float = None) -> tuple:
     """
     在安全區間內隨機放置物件。
     - 物件已在 Gazebo：直接移動
@@ -332,7 +351,16 @@ def random_place(model_name: str, seed: int = None,
         rospy.logerr(f"[rand] half_extent={half:.3f} makes effective range empty for {model_name}")
         return None
 
-    if fixed_yaw_deg is not None:
+    if fixed_x is not None and fixed_y is not None:
+        x = fixed_x
+        y = fixed_y
+        if fixed_yaw_deg is not None:
+            yaw_deg = fixed_yaw_deg
+            yaw = math.radians(yaw_deg)
+        else:
+            yaw = random.uniform(0, 2 * math.pi)
+            yaw_deg = math.degrees(yaw)
+    elif fixed_yaw_deg is not None:
         # 固定 yaw 模式（測試用）：位置取 workspace 中心
         x = (x_min + x_max) / 2.0
         y = (y_min + y_max) / 2.0
@@ -353,14 +381,17 @@ def random_place(model_name: str, seed: int = None,
     rospy.loginfo(f"[rand] placing '{model_name}' at x={x:.3f} y={y:.3f} z={table_z:.3f} yaw={yaw_deg:.1f}deg")
     rospy.loginfo(f"[rand] effective range: x=[{x_min:.3f},{x_max:.3f}] y=[{y_min:.3f},{y_max:.3f}]")
 
+    spawn_offset = OBJECT_SPAWN_OFFSET.get(model_name, 0.05)
     exists = model_exists(model_name)
     if exists:
         release_from_arm(model_name)
         go_home_both_arms()
-        success = move_object(model_name, x, y, table_z, yaw)
+        success = move_object(model_name, x, y, table_z + spawn_offset, yaw)
+        if success:
+            rospy.sleep(settle_wait)
     else:
         rospy.loginfo(f"[rand] model not in Gazebo, spawning from SDF...")
-        success = spawn_object(model_name, x, y, table_z, yaw)
+        success = spawn_object(model_name, x, y, table_z + spawn_offset, yaw)
         if success:
             rospy.sleep(settle_wait)
 
@@ -420,6 +451,14 @@ if __name__ == "__main__":
                         help="移除所有已知物件後再放置新物件")
     parser.add_argument("--yaw", type=float, default=None, metavar="DEGREES",
                         help="指定 yaw 角度（度），物件置於 workspace 中心，供測試用")
+    parser.add_argument("--x", type=float, default=None, metavar="X",
+                        help="指定 x 座標（公尺），需與 --y 一起使用")
+    parser.add_argument("--y", type=float, default=None, metavar="Y",
+                        help="指定 y 座標（公尺），需與 --x 一起使用")
+    parser.add_argument("--roll", type=float, default=None, metavar="DEGREES",
+                        help="覆蓋初始 roll（繞 X 軸，度）")
+    parser.add_argument("--pitch", type=float, default=None, metavar="DEGREES",
+                        help="覆蓋初始 pitch（繞 Y 軸，度）")
     args = parser.parse_args()
 
     rospy.init_node("random_object_placement", anonymous=True)
@@ -439,4 +478,9 @@ if __name__ == "__main__":
             print(f"[replace] 移除舊物件：{args.replace}")
             ok = remove_object(args.replace)
             print("✅ 舊物件已移除" if ok else f"⚠️ 舊物件移除失敗（{args.replace} 可能不存在）")
-        random_place(args.model_name, seed=args.seed, fixed_yaw_deg=args.yaw)
+        if args.roll is not None:
+            _override_roll_deg = args.roll
+        if args.pitch is not None:
+            _override_pitch_deg = args.pitch
+        random_place(args.model_name, seed=args.seed, fixed_yaw_deg=args.yaw,
+                     fixed_x=args.x, fixed_y=args.y)

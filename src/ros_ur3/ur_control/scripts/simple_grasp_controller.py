@@ -836,28 +836,11 @@ class SimpleGraspController:
         #     return ranked if ranked else None
         
         
-        # ── receiver_only：先 FP 估 pose → 再觸發 AnyGrasp ──
+        # ── receiver_only：直接觸發 AnyGrasp（FP 補全已停用）──
         if mode == "receiver_only":
-            rospy.loginfo("receiver_only 模式：FoundationPose → AnyGrasp")
+            rospy.loginfo("receiver_only 模式：直接 AnyGrasp（無 FP）")
 
-            # === Step 1: 觸發 FoundationPose ===
-            # 推算物件中心在交接區的位置
-            oc_handover = None
-            if self.object_centroid_offset is not None:
-                try:
-                    # 使用與 offset 計算時相同的參考點（robotiq_85_base_link）
-                    trans_grip_now = self.tf_buffer.lookup_transform(
-                        "world", "rightarm_robotiq_85_base_link",
-                        rospy.Time(0), rospy.Duration(1.0))
-                    t = trans_grip_now.transform.translation
-                    gc_now = np.array([t.x, t.y, t.z])
-                    oc_handover = gc_now + self.object_centroid_offset
-                    rospy.loginfo(
-                        f"📍 推算交接區物件中心: {oc_handover.round(3)}")
-                except Exception as e:
-                    rospy.logwarn(f"⚠️ 無法推算物件中心: {e}")
-            fp_pose = self.request_foundationpose(object_name, object_centroid_world=oc_handover)
-            fp_pose_list = fp_pose.tolist() if fp_pose is not None else None
+            fp_pose_list = None
 
             # === Step 2: 觸發 AnyGrasp ===
             plan_event = threading.Event()
@@ -1270,7 +1253,7 @@ class SimpleGraspController:
             rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
 
     def execute_mission(self):
-        TARGET_OBJECT_NAME = "spatula"
+        TARGET_OBJECT_NAME = "bowl"
 
         # 重置每次實驗的 metrics 與狀態
         self.metric_mission_start  = rospy.Time.now()

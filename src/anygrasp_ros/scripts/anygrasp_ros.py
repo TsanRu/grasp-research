@@ -7,13 +7,9 @@ import io
 import queue
 import cv2
 import json
+import time
 import threading
 import open3d as o3d
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 ros_path = '/opt/ros/noetic/lib/python3/dist-packages'
 if ros_path in sys.path:
@@ -56,6 +52,59 @@ def imgmsg_to_numpy(msg):
     return img
 
 
+class _Open3DViewer:
+    """非阻塞 Open3D 視覺化視窗：在獨立 daemon thread 中持續 poll_events。"""
+
+    def __init__(self, window_name, x=0, y=550, width=700, height=520):
+        self._window_name = window_name
+        self._x, self._y = x, y
+        self._width, self._height = width, height
+        self._geom_queue = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(
+                window_name=self._window_name,
+                width=self._width, height=self._height)
+            opt = vis.get_render_option()
+            opt.background_color = np.array([0.15, 0.15, 0.15])
+            opt.point_size = 2.5
+            current_geoms = []
+            while True:
+                try:
+                    new_geoms = self._geom_queue.get_nowait()
+                    for g in current_geoms:
+                        vis.remove_geometry(g, reset_bounding_box=False)
+                    current_geoms = list(new_geoms)
+                    first = True
+                    for g in current_geoms:
+                        vis.add_geometry(g, reset_bounding_box=first)
+                        first = False
+                except queue.Empty:
+                    pass
+                if not vis.poll_events():
+                    break   # 使用者關閉視窗，結束 thread
+                vis.update_renderer()
+                time.sleep(0.02)
+        except Exception as e:
+            try:
+                import rospy
+                rospy.logwarn(f"[Viewer] {self._window_name} 錯誤: {e}")
+            except Exception:
+                print(f"[Viewer] {self._window_name} 錯誤: {e}")
+
+    def update(self, geom_list):
+        """更新顯示幾何體；佇列已滿時丟棄舊幀。"""
+        try:
+            self._geom_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._geom_queue.put(list(geom_list))
+
+
 class Config:
     def __init__(self):
         self.checkpoint_path = './log/checkpoint_detection.tar'
@@ -63,7 +112,7 @@ class Config:
         self.gripper_height = 0.04
         self.top_down_grasp = False
         # 視覺化開關：要開啟時改成 True
-        self.debug = False
+        self.debug = True
 
 
 class AnyGraspHandoverNode:
@@ -147,91 +196,21 @@ class AnyGraspHandoverNode:
         # FoundationPose 給的物件 pose (camera frame, 4x4)
         self.object_pose_in_cam = None
 
-        # debug 視覺化：matplotlib Agg（純 CPU，不碰 OpenGL/GLFW）→ cv2 視窗
-        # 第一階段（dual）左下角，第二階段（FP補全）右下角
-        self._cv_queue = queue.Queue()
+        # debug 視覺化：Open3D Visualizer 各自跑在 daemon thread，不阻塞 ROS node
         if self.cfgs.debug:
-            self._cv_thread = threading.Thread(
-                target=self._cv_display_worker, daemon=True)
-            self._cv_thread.start()
+            self._viewer_giver = _Open3DViewer("AnyGrasp 給予臂",  x=0,   y=550)
+            self._viewer_recv  = _Open3DViewer("AnyGrasp 接收臂",  x=720, y=550)
 
         rospy.loginfo("🤖 AnyGrasp 節點就緒，等待觸發...")
 
-    def _cv_display_worker(self):
-        """啟動時就建好兩個視窗（左/右），之後只做 imshow 更新，不再新增視窗。"""
-        W, H = 700, 520
-        blank = np.zeros((H, W, 3), dtype=np.uint8)
-        left_name  = "AnyGrasp 給予臂"
-        right_name = "AnyGrasp 接收臂(FP補全)"
-        for name in (left_name, right_name):
-            cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(name, W, H)
-            cv2.imshow(name, blank)
-        cv2.moveWindow(left_name,  0,   550)
-        cv2.moveWindow(right_name, 720, 550)
-        cv2.waitKey(1)
-        while not rospy.is_shutdown():
-            try:
-                window_name, img_bgr = self._cv_queue.get(timeout=0.05)
-                cv2.imshow(window_name, img_bgr)
-            except queue.Empty:
-                pass
-            cv2.waitKey(1)
-
-    def _show_as_cv_window(self, geom_list, window_name, width=700, height=520):
-        """背景執行緒用 matplotlib Agg 渲染（無 OpenGL/GLFW），送給 cv2 視窗。"""
-        def _work():
-            try:
-                fig = Figure(figsize=(width / 100, height / 100), dpi=100)
-                canvas = FigureCanvasAgg(fig)
-                ax = fig.add_subplot(111, projection='3d')
-                for g in geom_list:
-                    if isinstance(g, o3d.geometry.PointCloud):
-                        pts = np.asarray(g.points)
-                        if len(pts) == 0:
-                            continue
-                        cols = np.clip(np.asarray(g.colors), 0, 1) \
-                            if g.has_colors() else np.full((len(pts), 3), 0.6)
-                        if len(pts) > 4000:
-                            idx = np.random.choice(len(pts), 4000, replace=False)
-                            pts, cols = pts[idx], cols[idx]
-                        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
-                                   c=cols, s=1, alpha=0.7, linewidths=0)
-                    elif isinstance(g, o3d.geometry.TriangleMesh):
-                        verts = np.asarray(g.vertices)
-                        tris  = np.asarray(g.triangles)
-                        if len(verts) == 0 or len(tris) == 0:
-                            continue
-                        if g.has_vertex_colors():
-                            col = np.mean(np.asarray(g.vertex_colors), axis=0)
-                        else:
-                            col = [0.2, 0.6, 1.0]
-                        if len(tris) > 300:
-                            tris = tris[np.random.choice(
-                                len(tris), 300, replace=False)]
-                        pc = Poly3DCollection(verts[tris], alpha=0.5,
-                                              facecolor=col, edgecolor='none')
-                        ax.add_collection3d(pc)
-                    elif isinstance(g, o3d.geometry.LineSet):
-                        pts   = np.asarray(g.points)
-                        lines = np.asarray(g.lines)
-                        cols  = np.asarray(g.colors) if g.has_colors() \
-                            else np.full((len(lines), 3), 0.2)
-                        for ln, c in zip(lines, cols):
-                            ax.plot([pts[ln[0], 0], pts[ln[1], 0]],
-                                    [pts[ln[0], 1], pts[ln[1], 1]],
-                                    [pts[ln[0], 2], pts[ln[1], 2]],
-                                    color=c, linewidth=1)
-                ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-                fig.tight_layout()
-                canvas.draw()
-                buf = canvas.buffer_rgba()
-                img_rgba = np.asarray(buf, dtype=np.uint8)
-                img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
-                self._cv_queue.put((window_name, img_bgr))
-            except Exception as e:
-                rospy.logwarn(f"[Debug] 渲染失敗: {e}")
-        threading.Thread(target=_work, daemon=True).start()
+    def _show_as_cv_window(self, geom_list, window_name, **_):
+        """將幾何體送給對應的 Open3D 非阻塞視窗。"""
+        if not self.cfgs.debug:
+            return
+        if window_name == "AnyGrasp 給予臂":
+            self._viewer_giver.update(geom_list)
+        else:
+            self._viewer_recv.update(geom_list)
 
     def trigger_callback(self, msg):
         try:
@@ -917,6 +896,46 @@ class AnyGraspHandoverNode:
             rospy.logwarn(f"⚠️ RANSAC+ICP 補全失敗: {e}")
             return pts_clean
 
+    def compute_receiver_lims(self, points, camera_frame, radius=0.12):
+        """
+        以 receiver_centroid_world 為中心，直接建固定大小的 lims。
+        同時回傳落在框內的點雲供視覺化用。
+        """
+        if self.receiver_centroid_world is None:
+            return None
+
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                camera_frame, "world",
+                rospy.Time(0), rospy.Duration(1.0))
+            t = trans.transform.translation
+            q = trans.transform.rotation
+            T_cw = np.eye(4)
+            T_cw[:3, 3] = [t.x, t.y, t.z]
+            T_cw[:3, :3] = Rotation.from_quat(
+                [q.x, q.y, q.z, q.w]).as_matrix()
+            rc_cam = (T_cw @ np.array([*self.receiver_centroid_world, 1.0]))[:3]
+        except Exception as e:
+            rospy.logwarn(f"⚠️ world→camera 轉換失敗: {e}")
+            return None
+
+        lims = [
+            float(rc_cam[0]) - radius, float(rc_cam[0]) + radius,
+            float(rc_cam[1]) - radius, float(rc_cam[1]) + radius,
+            float(rc_cam[2]) - radius, float(rc_cam[2]) + radius,
+        ]
+        rospy.loginfo(f"📍 receiver_centroid (cam): {rc_cam}")
+        rospy.loginfo(f"📦 receiver lims: {[f'{v:.3f}' for v in lims]}")
+
+        # 視覺化用：框內的場景點
+        mask = ((points[:, 0] >= lims[0]) & (points[:, 0] <= lims[1]) &
+                (points[:, 1] >= lims[2]) & (points[:, 1] <= lims[3]) &
+                (points[:, 2] >= lims[4]) & (points[:, 2] <= lims[5]))
+        recv_points_vis = points[mask]
+        rospy.loginfo(f"📐 框內點數: {len(recv_points_vis)}")
+
+        return lims, recv_points_vis
+
     def compute_receiver_lims_from_icp(self, points_completed,
                                     camera_frame, pad=0.02):
         """
@@ -1240,70 +1259,25 @@ class AnyGraspHandoverNode:
                             else "camera_color_optical_frame")
                 
             if mode == "receiver_only":
-                rospy.loginfo("🧠 receiver_only：夾爪移除 → ICP 補全 → 偵測")
+                rospy.loginfo("🧠 receiver_only：直接用相機點雲 + 旋轉接收區偵測")
 
-                # Step 1：移除夾爪點雲
-                points_clean, colors_clean = self.remove_gripper_points(
-                    points_full, colors_full, camera_frame)
-
-                if points_clean.shape[0] < 200:
-                    rospy.logwarn("⚠️ 移除夾爪後點雲過少，中止")
-                    self.plan_pub.publish(json.dumps([]))
-                    return
-                
-                # # Step 2：RANSAC 方法  
-                # # ROI 過濾，只保留物件附近的點
-                # points_roi = self.extract_object_roi(points_clean, camera_frame)
-                # points_completed = self.complete_object_with_ransac_icp_camera_frame(
-                #     points_roi, camera_frame)
-
-                # # Step 2：指尖中點 + ICP 補全
-                # points_completed = self.complete_object_with_icp_camera_frame(
-                #     points_clean, camera_frame)
-                
-                # Step 2：FoundationPose
-                points_completed = None
-                if self.object_pose_in_cam is not None:
-                    rospy.loginfo("🎯 使用 FoundationPose pose 補全")
-                    points_completed = self.complete_object_with_foundationpose_pose(
-                        self.object_pose_in_cam)
-
-                if points_completed is None:
-                    rospy.logwarn("⚠️ 無 FoundationPose pose，使用移除夾爪後點雲")
-                    points_completed = points_clean
-
-                # Step 3：計算 receiver lims
+                # 直接使用原始相機點雲（不移除夾爪）
                 recv_points_vis = None
-                result = self.compute_receiver_lims_from_icp(
-                    points_completed, camera_frame)
+                result = self.compute_receiver_lims(
+                    points_full, camera_frame)
                 if result is None:
-                    rospy.logwarn("⚠️ 無法計算 receiver lims，改用點雲 bounding box")
-                    lims_recv_new = self.get_dynamic_lims(
-                        self.filter_outlier_points(points_completed))
-                else:
-                    lims_recv_new, recv_points_vis = result
-                if lims_recv_new is None:
-                    rospy.logwarn("⚠️ lims 計算失敗，中止")
+                    rospy.logwarn("⚠️ 無法計算 receiver lims，中止")
                     self.plan_pub.publish(json.dumps([]))
                     return
+                lims_recv_new, recv_points_vis = result
 
-                # Step 4：補全點雲的顏色（均勻灰色）
-                colors_completed = np.full(
-                    (len(points_completed), 3), 0.5, dtype=np.float32)
+                rospy.loginfo(
+                    f"[DEBUG] receiver_only 餵 AnyGrasp: "
+                    f"pts={points_full.shape[0]}, lims={lims_recv_new}")
 
-                
-                rospy.loginfo(
-                    f"[DEBUG] receiver_only 餵 AnyGrasp:")
-                rospy.loginfo(
-                    f"  points_completed shape={points_completed.shape}, "
-                    f"範圍 x=[{points_completed[:,0].min():.3f},{points_completed[:,0].max():.3f}] "
-                    f"y=[{points_completed[:,1].min():.3f},{points_completed[:,1].max():.3f}] "
-                    f"z=[{points_completed[:,2].min():.3f},{points_completed[:,2].max():.3f}]")
-                rospy.loginfo(f"  lims={lims_recv_new}")
-                
-                # Step 5：AnyGrasp 偵測
+                # AnyGrasp 偵測
                 gg_recv, _ = self.anygrasp.get_grasp(
-                    points_completed, colors_completed,
+                    points_full, colors_full,
                     lims=lims_recv_new,
                     apply_object_mask=False,
                     dense_grasp=True,
@@ -1330,13 +1304,12 @@ class AnyGraspHandoverNode:
                     if self.cfgs.debug:
                         trans_mat = np.array(
                             [[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1]])
-                        # 灰色：完整補全 mesh
                         cloud = o3d.geometry.PointCloud()
-                        cloud.points = o3d.utility.Vector3dVector(points_completed)
-                        cloud.colors = o3d.utility.Vector3dVector(colors_completed)
+                        cloud.points = o3d.utility.Vector3dVector(points_full)
+                        cloud.colors = o3d.utility.Vector3dVector(colors_full)
                         cloud.transform(trans_mat)
                         vis_list = [cloud]
-                        # 紅色：receiver 篩選區域（確認是握柄還是鎚頭）
+                        # 紅色：receiver 篩選區域
                         if recv_points_vis is not None and len(recv_points_vis) > 0:
                             recv_pcd = o3d.geometry.PointCloud()
                             recv_pcd.points = o3d.utility.Vector3dVector(recv_points_vis)
@@ -1349,9 +1322,8 @@ class AnyGraspHandoverNode:
                             g.transform(trans_mat)
                             g.paint_uniform_color([0, 0, 1])
                             vis_list.append(g)
-                        self._show_as_cv_window(
-                            vis_list, "AnyGrasp 接收臂(FP補全)")
-                        rospy.loginfo("👀 [Debug] FP補全夾取姿態（右下角視窗）")
+                        self._show_as_cv_window(vis_list, "AnyGrasp 接收臂")
+                        rospy.loginfo("👀 [Debug] 接收臂夾取姿態")
                         
                 else:
                     rospy.logwarn("❌ receiver_only 找不到有效姿態")
