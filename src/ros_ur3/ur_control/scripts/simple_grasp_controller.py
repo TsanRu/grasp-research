@@ -1295,7 +1295,7 @@ class SimpleGraspController:
             rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
 
     def execute_mission(self):
-        TARGET_OBJECT_NAME = "spatula"
+        TARGET_OBJECT_NAME = "hammer"
 
         # 重置每次實驗的 metrics 與狀態
         self.metric_mission_start  = rospy.Time.now()
@@ -1503,7 +1503,6 @@ class SimpleGraspController:
             receiver_base,
             object_pos
         )
-        rotation_angle = 0.0  # no-rotation ablation
 
         # 記錄旋轉前的 Gazebo yaw（供非功能端量測：基準 = pre_yaw + rotation_angle）
         try:
