@@ -1259,25 +1259,52 @@ class AnyGraspHandoverNode:
                             else "camera_color_optical_frame")
                 
             if mode == "receiver_only":
-                rospy.loginfo("🧠 receiver_only：直接用相機點雲 + 旋轉接收區偵測")
+                rospy.loginfo("🧠 receiver_only：FP 補全 → ICP 接收區 → AnyGrasp")
 
-                # 直接使用原始相機點雲（不移除夾爪）
-                recv_points_vis = None
-                result = self.compute_receiver_lims(
-                    points_full, camera_frame)
-                if result is None:
-                    rospy.logwarn("⚠️ 無法計算 receiver lims，中止")
+                # Step 1：移除夾爪點雲
+                points_clean, colors_clean = self.remove_gripper_points(
+                    points_full, colors_full, camera_frame)
+                if points_clean.shape[0] < 200:
+                    rospy.logwarn("⚠️ 移除夾爪後點雲過少，中止")
                     self.plan_pub.publish(json.dumps([]))
                     return
-                lims_recv_new, recv_points_vis = result
+
+                # Step 2：FP 補全（用 FP pose 把 CAD mesh 採樣為完整物件點雲）
+                if self.object_pose_in_cam is not None:
+                    points_completed = self.complete_object_with_foundationpose_pose(
+                        self.object_pose_in_cam)
+                    if points_completed is None or len(points_completed) < 50:
+                        rospy.logwarn("⚠️ FP 補全失敗，fallback 用 points_clean")
+                        points_completed = points_clean
+                else:
+                    rospy.logwarn("⚠️ 無 FP pose，fallback 用 points_clean")
+                    points_completed = points_clean
+
+                # Step 3：計算 receiver lims（基於補全後的物件點雲）
+                recv_points_vis = None
+                result = self.compute_receiver_lims_from_icp(
+                    points_completed, camera_frame)
+                if result is None:
+                    rospy.logwarn("⚠️ 無法計算 receiver lims，改用 bounding box")
+                    lims_recv_new = self.get_dynamic_lims(
+                        self.filter_outlier_points(points_completed))
+                else:
+                    lims_recv_new, recv_points_vis = result
+                if lims_recv_new is None:
+                    rospy.logwarn("⚠️ lims 計算失敗，中止")
+                    self.plan_pub.publish(json.dumps([]))
+                    return
+
+                colors_completed = np.full(
+                    (len(points_completed), 3), 0.5, dtype=np.float32)
 
                 rospy.loginfo(
                     f"[DEBUG] receiver_only 餵 AnyGrasp: "
-                    f"pts={points_full.shape[0]}, lims={lims_recv_new}")
+                    f"pts={points_completed.shape[0]}, lims={lims_recv_new}")
 
-                # AnyGrasp 偵測
+                # Step 4：AnyGrasp 偵測
                 gg_recv, _ = self.anygrasp.get_grasp(
-                    points_full, colors_full,
+                    points_completed, colors_completed,
                     lims=lims_recv_new,
                     apply_object_mask=False,
                     dense_grasp=True,

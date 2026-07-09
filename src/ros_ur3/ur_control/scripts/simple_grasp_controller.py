@@ -836,11 +836,28 @@ class SimpleGraspController:
         #     return ranked if ranked else None
         
         
-        # ── receiver_only：直接觸發 AnyGrasp（FP 補全已停用）──
         if mode == "receiver_only":
-            rospy.loginfo("receiver_only 模式：直接 AnyGrasp（無 FP）")
+            rospy.loginfo("receiver_only 模式：觸發 FoundationPose → AnyGrasp")
 
-            fp_pose_list = None
+            # 推算物件在交接區的當前位置作為 FP hint
+            oc_handover = None
+            if self.object_centroid_offset is not None:
+                try:
+                    trans_grip_now = self.tf_buffer.lookup_transform(
+                        "world", "rightarm_robotiq_85_base_link",
+                        rospy.Time(0), rospy.Duration(1.0))
+                    t = trans_grip_now.transform.translation
+                    gc_now = np.array([t.x, t.y, t.z])
+                    oc_handover = gc_now + self.object_centroid_offset
+                    rospy.loginfo(
+                        f"📍 推算交接區物件中心: {oc_handover.round(3)}")
+                except Exception as e:
+                    rospy.logwarn(f"⚠️ 無法推算物件中心: {e}")
+
+            fp_pose = self.request_foundationpose(
+                object_name,
+                object_centroid_world=oc_handover)
+            fp_pose_list = fp_pose.tolist() if fp_pose is not None else None
 
             # === Step 2: 觸發 AnyGrasp ===
             plan_event = threading.Event()
@@ -1152,6 +1169,7 @@ class SimpleGraspController:
         "sugar_box":   "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/004_sugar_box/google_16k/nontextured.stl",
         "spatula":     "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/033_spatula/google_16k/nontextured.stl",
         "spoon":       "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/031_spoon/google_16k/nontextured.stl",
+        "tomato_soup_can": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/005_tomato_soup_can/google_16k/nontextured.stl",
     }
     COLLISION_MESH_SCALE = 0.85  # 略小於實際，補償 FP 位姿誤差
 
@@ -1187,6 +1205,30 @@ class SimpleGraspController:
                 return True
             rospy.sleep(0.1)
         return False
+
+    def _add_world_collision_mesh(self, object_name):
+        """從 Gazebo 取得物件當前位姿，加入 MoveIt 場景作為障礙物（不 attach）。
+        用於 pre-grasp 規劃前，讓 MoveIt 繞開物件而不撞倒它。"""
+        mesh_path = self.OBJECT_MESH_MAP.get(object_name)
+        if not mesh_path or not os.path.exists(mesh_path):
+            return False
+        try:
+            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+            get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+            resp = get_state(object_name, 'world')
+            ps = PoseStamped()
+            ps.header.frame_id = "world"
+            ps.header.stamp = rospy.Time.now()
+            ps.pose = resp.pose
+            col_name = object_name + "_col"
+            s = self.COLLISION_MESH_SCALE
+            self.scene.add_mesh(col_name, ps, mesh_path, size=(s, s, s))
+            self._wait_for_scene_update(col_name, expect_attached=False)
+            rospy.loginfo(f"[collision mesh] ✅ {col_name} 加入場景障礙物（Gazebo 位姿）")
+            return True
+        except Exception as e:
+            rospy.logwarn(f"[collision mesh] 加入障礙物失敗: {e}")
+            return False
 
     def _attach_collision_mesh(self, object_name):
         """把物件 mesh 加入 MoveIt 場景並 attach 到右手 wrist，讓接收臂規劃時知道要閃它。"""
@@ -1253,7 +1295,7 @@ class SimpleGraspController:
             rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
 
     def execute_mission(self):
-        TARGET_OBJECT_NAME = "bowl"
+        TARGET_OBJECT_NAME = "spatula"
 
         # 重置每次實驗的 metrics 與狀態
         self.metric_mission_start  = rospy.Time.now()
@@ -1300,6 +1342,9 @@ class SimpleGraspController:
                 self.calculate_grasp_targets(pose_right_target)
             self.right_grasp_center_z = pose_fingertip.position.z
 
+            # 抓取前把物件加入場景，讓 pre-grasp 路徑規劃繞開它而不撞倒
+            self._add_world_collision_mesh(TARGET_OBJECT_NAME)
+
             # Pre-grasp：先規劃，失敗直接換下一組
             self.move_group.set_pose_target(pose_wrist_pre)
             plan_result = self.move_group.plan()
@@ -1337,6 +1382,9 @@ class SimpleGraspController:
                     continue
                 self.move_group.stop()
                 self.move_group.clear_pose_targets()
+
+            # Approach 前移除障礙物（終點在物件表面，需允許進入）
+            self.scene.remove_world_object(TARGET_OBJECT_NAME + "_col")
 
             # Approach
             (plan_app, fraction) = self.move_group.compute_cartesian_path(
@@ -1455,6 +1503,7 @@ class SimpleGraspController:
             receiver_base,
             object_pos
         )
+        rotation_angle = 0.0  # no-rotation ablation
 
         # 記錄旋轉前的 Gazebo yaw（供非功能端量測：基準 = pre_yaw + rotation_angle）
         try:
