@@ -789,6 +789,97 @@ class SimpleGraspController:
         self.latest_fp_pose_cam = pose
         return pose
     
+    def _trigger_dual_no_llm(self, object_name, timeout=120.0):
+        """NO_LLM_MODE 用：從 Gazebo 取得物件中心，觸發 AnyGrasp dual_no_llm。
+        給予臂以整個物件 lims 讓 AnyGrasp 選最佳姿態，接收臂由 receiver_only 流程處理。"""
+        try:
+            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+            get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+            resp = get_state(object_name, 'world')
+            obj_center = np.array([
+                resp.pose.position.x,
+                resp.pose.position.y,
+                resp.pose.position.z,
+            ])
+        except Exception as e:
+            rospy.logerr(f"[no_llm] 無法取得 {object_name} Gazebo 位置: {e}")
+            return None
+
+        rospy.loginfo(f"[no_llm] obj_center={obj_center.round(3)}")
+
+        plan_event = threading.Event()
+        plan_container = [None]
+
+        def plan_cb(msg):
+            try:
+                plan_container[0] = json.loads(msg.data)
+                plan_event.set()
+            except Exception:
+                pass
+
+        plan_sub = rospy.Subscriber("/anygrasp/handover_plan", String, plan_cb)
+        rospy.sleep(0.2)
+
+        anygrasp_payload = json.dumps({
+            "object_name": object_name,
+            "mode": "dual_no_llm",
+            "object_centroid_world": obj_center.tolist(),
+        })
+        self.anygrasp_trigger_pub.publish(anygrasp_payload)
+
+        plan_done = plan_event.wait(timeout=timeout)
+        plan_sub.unregister()
+
+        if not plan_done or plan_container[0] is None:
+            rospy.logerr("[no_llm] 等待 AnyGrasp dual_no_llm 回傳逾時")
+            return None
+
+        ranked = plan_container[0]
+        return ranked if ranked else None
+
+    def _trigger_left_no_llm(self, object_name, timeout=60.0):
+        """NO_LLM_MODE fallback：物件已放回桌面，直接用 Gazebo 中心觸發左臂偵測。"""
+        try:
+            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+            get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+            resp = get_state(object_name, 'world')
+            obj_center = np.array([
+                resp.pose.position.x,
+                resp.pose.position.y,
+                resp.pose.position.z,
+            ])
+        except Exception as e:
+            rospy.logerr(f"[no_llm] 無法取得 {object_name} Gazebo 位置: {e}")
+            return None
+
+        plan_event = threading.Event()
+        plan_container = [None]
+
+        def plan_cb(msg):
+            try:
+                plan_container[0] = json.loads(msg.data)
+                plan_event.set()
+            except Exception:
+                pass
+
+        plan_sub = rospy.Subscriber("/anygrasp/handover_plan", String, plan_cb)
+        rospy.sleep(0.2)
+        self.anygrasp_trigger_pub.publish(json.dumps({
+            "object_name": object_name,
+            "mode": "left_no_llm",
+            "object_centroid_world": obj_center.tolist(),
+        }))
+
+        plan_done = plan_event.wait(timeout=timeout)
+        plan_sub.unregister()
+
+        if not plan_done or plan_container[0] is None:
+            rospy.logerr("[no_llm] 等待 AnyGrasp left_no_llm 回傳逾時")
+            return None
+
+        result = plan_container[0]
+        return result if result else None
+
     def trigger_full_detection(self, object_name, mode="dual",
                            rotation_angle=0.0, timeout=120.0):
         
@@ -925,10 +1016,13 @@ class SimpleGraspController:
         rospy.loginfo("LLM 完成，觸發 AnyGrasp...")
         
         llm_data = llm_result_container[0]
-        if mode == "dual":  # 只有 dual 才更新策略
+        if mode in ("dual", "no_llm"):
             self.handover_strategy = llm_data.get("handover_strategy", "geometric")
             self.receiver_part = llm_data.get("receiver_part", None)
             rospy.loginfo(f"📋 交接策略: {self.handover_strategy}, 接取部位: {self.receiver_part}")
+
+        # no_llm → brain 已產生 mask，AnyGrasp 讀 dual pipeline；left_no_llm → left_only pipeline
+        anygrasp_mode = {"no_llm": "dual", "left_no_llm": "left_only"}.get(mode, mode)
 
         plan_event = threading.Event()
         plan_container = [None]
@@ -945,7 +1039,7 @@ class SimpleGraspController:
         rospy.sleep(0.2)
         anygrasp_payload = json.dumps({
             "object_name": object_name,
-            "mode": mode              # ← 用變數，dual 模式這裡就是 "dual"
+            "mode": anygrasp_mode
         })
         self.anygrasp_trigger_pub.publish(anygrasp_payload)
 
@@ -1150,6 +1244,9 @@ class SimpleGraspController:
         "C（內收前伸）": [0.7,  -0.8,  -2.0,  -0.8,  1.8,    -0.3],
     }
 
+    # 消融實驗旗標：True = 不使用 LLM，改用幾何規則選抓取區域
+    NO_LLM_MODE = True
+
     # 各物件理想交接 yaw（世界座標，handle 朝向左臂 -Y 方向）
     IDEAL_YAW = {
         "hammer":              -21.5,
@@ -1170,6 +1267,8 @@ class SimpleGraspController:
         "spatula":     "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/033_spatula/google_16k/nontextured.stl",
         "spoon":       "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/031_spoon/google_16k/nontextured.stl",
         "tomato_soup_can": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/005_tomato_soup_can/google_16k/nontextured.stl",
+        "banana":          "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/011_banana/google_16k/nontextured.stl",
+        "bowl":            "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/024_bowl/google_16k/nontextured.stl",
     }
     COLLISION_MESH_SCALE = 0.85  # 略小於實際，補償 FP 位姿誤差
 
@@ -1295,7 +1394,7 @@ class SimpleGraspController:
             rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
 
     def execute_mission(self):
-        TARGET_OBJECT_NAME = "hammer"
+        TARGET_OBJECT_NAME = "spatula"
 
         # 重置每次實驗的 metrics 與狀態
         self.metric_mission_start  = rospy.Time.now()
@@ -1310,7 +1409,10 @@ class SimpleGraspController:
         # =========================================================
         # 階段一：視覺偵測，取得右手夾取姿態
         # =========================================================
-        ranked_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="dual")
+        if self.NO_LLM_MODE:
+            ranked_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="dual_no_llm")
+        else:
+            ranked_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="dual")
         if ranked_groups is None:
             rospy.logerr("初始偵測失敗，任務中止")
             return
@@ -1709,10 +1811,13 @@ class SimpleGraspController:
             self.go_home("right")  # 原地釋放後直接回 Home
 
         rospy.loginfo("右手已退開，觸發左手重新偵測")
-        
-        rospy.loginfo("重新觸發 left_only 偵測，讓左手從桌面重新夾取")
+
+        rospy.loginfo("重新觸發左手偵測，讓左手從桌面重新夾取")
         _t_left_infer = rospy.Time.now()
-        left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_only")
+        if self.NO_LLM_MODE:
+            left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_no_llm")
+        else:
+            left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_only")
         _left_infer_elapsed = (rospy.Time.now() - _t_left_infer).to_sec()
         if self.metric_inference_time is not None:
             self.metric_inference_time += _left_infer_elapsed

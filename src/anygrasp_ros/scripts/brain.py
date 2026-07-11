@@ -463,6 +463,40 @@ class SemanticBrainNode:
                 cv2.cvtColor(cropped_img, cv2.COLOR_RGB2BGR)
             )
 
+            # ── no_llm / left_no_llm 模式：跳過 GPT，OWL bbox → SAM 精割 → 幾何切割 ──
+            if mode in ("no_llm", "left_no_llm", "dual_no_llm"):
+                rospy.loginfo(f"🔷 [{mode}] 跳過 GPT，執行 OWL+SAM")
+                sam_inputs = self.sam_processor(
+                    img_pil,
+                    input_boxes=[[[x_min, y_min, x_max, y_max]]],
+                    return_tensors="pt"
+                ).to(self.device)
+                with torch.no_grad():
+                    sam_outputs = self.sam_model(**sam_inputs)
+                sam_masks = self.sam_processor.image_processor.post_process_masks(
+                    sam_outputs.pred_masks.cpu(),
+                    sam_inputs.original_sizes.cpu(),
+                    sam_inputs.reshaped_input_sizes.cpu()
+                )
+                global_mask = (sam_masks[0][0][0].numpy() * 255).astype(np.uint8)
+                torch.cuda.empty_cache()
+
+                # 整個物件 mask 直接存，lims 從整體點雲算，讓 get_arm_specific_grasps 選姿態
+                cv2.imwrite(os.path.join(self.save_dir, "giver_mask.png"), global_mask)
+                cv2.imwrite(os.path.join(self.save_dir, "receiver_mask.png"), global_mask)
+                rospy.loginfo(f"✅ [{mode}] SAM mask 儲存完畢（整體物件）")
+
+                self.done_pub.publish(json.dumps({
+                    "status": "done",
+                    "object_name": object_name,
+                    "mode": mode,
+                    "receiver_grids": [],
+                    "giver_grids": [],
+                    "handover_strategy": "geometric",
+                    "receiver_part": None
+                }))
+                return
+
             # 改良版 SoM 網格繪製
             rospy.loginfo("✂️ [2/4] 繪製 Set-of-Mark 網格...")
             grid_img_rgb, grid_dict_local = draw_som_grid(cropped_img, rows=5, cols=5)

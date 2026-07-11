@@ -385,7 +385,8 @@ def random_place(model_name: str, seed: int = None,
     exists = model_exists(model_name)
     if exists:
         release_from_arm(model_name)
-        go_home_both_arms()
+    go_home_both_arms()
+    if exists:
         success = move_object(model_name, x, y, table_z + spawn_offset, yaw)
         if success:
             rospy.sleep(settle_wait)
