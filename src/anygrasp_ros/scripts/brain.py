@@ -255,6 +255,44 @@ LEFT_ONLY_PROMPT = """
 }
 """
 
+INTENT_UNDERSTANDING_PROMPT = """
+你是一個雙臂機器人協作系統的語意理解模組，負責在抓取與交接動作開始之前，
+判斷使用者真正想要的物件是什麼。
+
+【角色定義】
+給予臂（give arm）：負責從工作區夾取物件，並透過空中交接將物件遞送出去。
+接收臂（receive arm）：在交接區接住物件，代表「使用者」這個語意角色——
+使用者在此情境中扮演接收方，物件最終會被交付到使用者可以直接取用的位置。
+
+你將收到一張桌面場景圖，圖中包含當前桌面上實際存在的物件。
+
+【使用者輸入】
+"{user_input}"
+
+【可用物件清單】
+你的回答必須從以下清單中選擇，不得使用清單以外的名稱：
+hammer, scissors, spatula, banana, tomato_soup_can, sugar_box, bowl, large_clamp
+
+【任務】
+請觀察畫面中的物件，判斷使用者指的是畫面中的哪一個，
+並從上方清單中選出完全一致的名稱（例如應輸出 tomato_soup_can，不可輸出 can 或 soup）。
+
+使用者的描述可能不是直接的物件名稱，而是功能性或外觀描述
+（例如「可以鎚東西的工具」「尖尖的那個」），請結合畫面內容合理判斷。
+
+【confidence 判斷標準】
+- high：畫面中有明確對應物件，描述非常吻合
+- medium：有可能對應但存在歧義，或畫面中有多個候選
+- low：無法確認，或畫面中找不到符合描述的物件
+
+【輸出格式】（純 JSON，不含任何其他文字或 markdown）
+{{
+    "object_name": "必須是上方清單中的其中一個名稱，完整複製貼上；若畫面中找不到對應物件則填 unknown",
+    "confidence": "high / medium / low",
+    "reasoning": "一句話說明如何結合畫面與使用者輸入推斷出這個物件（用中文回覆）"
+}}
+"""
+
 def pil_to_base64(img):
     buffer = BytesIO()
     img.save(buffer, format="PNG")
@@ -371,6 +409,7 @@ class SemanticBrainNode:
 
         self.save_dir = "/home/rvl/ros_ws/src/anygrasp_sdk/grasp_detection/my_gazebo_data"
         self.target_object = ""
+        self.user_input = ""
         self.need_process = False
         self.latest_image = None
         self.is_processing = False
@@ -391,22 +430,44 @@ class SemanticBrainNode:
         """持續接收最新影像，不做處理"""
         self.latest_image = msg
 
+    def resolve_intent(self, user_input: str, img_pil) -> str:
+        """用 GPT 將使用者自然語言描述解析成英文物件名稱"""
+        rospy.loginfo(f"🔍 解析使用者意圖：「{user_input}」")
+        prompt = INTENT_UNDERSTANDING_PROMPT.format(user_input=user_input)
+        response = self.gpt_client.chat.completions.create(
+            model="gpt-5.4",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{pil_to_base64(img_pil)}"}},
+                ]
+            }]
+        )
+        raw = response.choices[0].message.content
+        result = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        name = result.get("object_name", "unknown")
+        rospy.loginfo(f"✅ 意圖解析結果：{name}（信心：{result.get('confidence')}，理由：{result.get('reasoning')}）")
+        return name
+
     def trigger_callback(self, msg):
         """收到手臂控制端的觸發訊號"""
         if self.is_processing:
             rospy.logwarn("⏳ AI 正在處理中，忽略重複的 trigger 訊號...")
             return
-        
+
         try:
             data = json.loads(msg.data)
+            self.user_input = data.get("user_input", "")   # 自然語言輸入（優先）
             self.target_object = data.get("object_name", "unknown")
-            self.mode = data.get("mode", "dual")  # "dual" 或 "left_only"
+            self.mode = data.get("mode", "dual")
         except json.JSONDecodeError:
-            # 向下相容舊格式（純字串）
+            self.user_input = ""
             self.target_object = msg.data
             self.mode = "dual"
 
-        rospy.loginfo(f"⚡ 收到 trigger_llm，目標: {self.target_object}，模式: {self.mode}")
+        log_target = f"user_input=「{self.user_input}」" if self.user_input else f"object_name={self.target_object}"
+        rospy.loginfo(f"⚡ 收到 trigger_llm，目標: {log_target}，模式: {self.mode}")
         self.need_process = True
 
     def run(self):
@@ -416,18 +477,27 @@ class SemanticBrainNode:
             if self.need_process and self.latest_image is not None:
                 self.need_process = False
                 self.is_processing = True # 鎖上
-                self.process(self.latest_image, self.target_object, self.mode)
+                self.process(self.latest_image, self.target_object, self.mode, self.user_input)
                 self.is_processing = False # 處理完解鎖
             rate.sleep()
 
-    def process(self, img_msg, object_name, mode="dual"):
+    def process(self, img_msg, object_name, mode="dual", user_input=""):
         t_start = rospy.Time.now()
-        rospy.loginfo(f"📸 開始處理影像，物件: {object_name}，模式: {mode}")
         try:
             img_np = imgmsg_to_numpy(img_msg)
             h, w = img_np.shape[:2]
             img_pil = PILImage.fromarray(img_np)
-            
+
+            # 如果收到的是自然語言，先用 GPT 解析成英文物件名
+            if user_input:
+                object_name = self.resolve_intent(user_input, img_pil)
+                if object_name == "unknown":
+                    rospy.logerr(f"❌ 無法從畫面中識別使用者描述的物件：「{user_input}」")
+                    self.done_pub.publish(json.dumps({"status": "fail", "reason": "intent_not_resolved"}))
+                    return
+
+            rospy.loginfo(f"📸 開始處理影像，物件: {object_name}，模式: {mode}")
+
             # 儲存原始影像
             cv2.imwrite(
                 os.path.join(self.save_dir, "original_rgb.png"),
@@ -462,40 +532,6 @@ class SemanticBrainNode:
                 os.path.join(self.save_dir, "object_crop_raw.png"),
                 cv2.cvtColor(cropped_img, cv2.COLOR_RGB2BGR)
             )
-
-            # ── no_llm / left_no_llm 模式：跳過 GPT，OWL bbox → SAM 精割 → 幾何切割 ──
-            if mode in ("no_llm", "left_no_llm", "dual_no_llm"):
-                rospy.loginfo(f"🔷 [{mode}] 跳過 GPT，執行 OWL+SAM")
-                sam_inputs = self.sam_processor(
-                    img_pil,
-                    input_boxes=[[[x_min, y_min, x_max, y_max]]],
-                    return_tensors="pt"
-                ).to(self.device)
-                with torch.no_grad():
-                    sam_outputs = self.sam_model(**sam_inputs)
-                sam_masks = self.sam_processor.image_processor.post_process_masks(
-                    sam_outputs.pred_masks.cpu(),
-                    sam_inputs.original_sizes.cpu(),
-                    sam_inputs.reshaped_input_sizes.cpu()
-                )
-                global_mask = (sam_masks[0][0][0].numpy() * 255).astype(np.uint8)
-                torch.cuda.empty_cache()
-
-                # 整個物件 mask 直接存，lims 從整體點雲算，讓 get_arm_specific_grasps 選姿態
-                cv2.imwrite(os.path.join(self.save_dir, "giver_mask.png"), global_mask)
-                cv2.imwrite(os.path.join(self.save_dir, "receiver_mask.png"), global_mask)
-                rospy.loginfo(f"✅ [{mode}] SAM mask 儲存完畢（整體物件）")
-
-                self.done_pub.publish(json.dumps({
-                    "status": "done",
-                    "object_name": object_name,
-                    "mode": mode,
-                    "receiver_grids": [],
-                    "giver_grids": [],
-                    "handover_strategy": "geometric",
-                    "receiver_part": None
-                }))
-                return
 
             # 改良版 SoM 網格繪製
             rospy.loginfo("✂️ [2/4] 繪製 Set-of-Mark 網格...")

@@ -60,6 +60,7 @@ OBJECT_WORKSPACE = {
     "sugar_box":       (0.70, 1.05, -0.05, 0.20),
     "spatula":         (0.70, 1.05, -0.05, 0.20),
     "spoon":           (0.70, 1.05, -0.05, 0.20),
+    "large_clamp":     (0.70, 1.05, -0.05, 0.20),
 }
 DEFAULT_WORKSPACE = (0.70, 1.05, -0.05, 0.20)
 
@@ -78,6 +79,7 @@ OBJECT_TABLE_Z = {
     "sugar_box":       0.749,  # 側臥（第二大面朝下）
     "spatula":         0.6855, # 平躺（實測）
     "spoon":           0.6853, # 平躺（實測）
+    "large_clamp":     0.6844, # 實測
 }
 DEFAULT_TABLE_Z = 0.70
 
@@ -105,6 +107,7 @@ OBJECT_HALF_EXTENT = {
     "sugar_box":       0.09,   # 側臥，長邊 17.6cm 水平，半寬 8.8cm
     "spatula":         0.10,   # 全長 30.6cm，workspace 限制取 10cm（同 hammer）
     "spoon":           0.09,   # 全長 18.6cm，碗端距中心 12cm，取 9cm
+    "large_clamp":     0.09,   # 全長 17.1cm，估計夾取點距中心約 9cm
 }
 DEFAULT_HALF_EXTENT = 0.08
 
@@ -149,6 +152,7 @@ OBJECT_SDF = {
     "sugar_box":       "004_sugar_box/sugar_box.sdf",
     "spatula":         "033_spatula/spatula.sdf",
     "spoon":           "031_spoon/spoon.sdf",
+    "large_clamp":     "051_large_clamp/large_clamp.sdf",
 }
 
 
@@ -385,8 +389,7 @@ def random_place(model_name: str, seed: int = None,
     exists = model_exists(model_name)
     if exists:
         release_from_arm(model_name)
-    go_home_both_arms()
-    if exists:
+        go_home_both_arms()
         success = move_object(model_name, x, y, table_z + spawn_offset, yaw)
         if success:
             rospy.sleep(settle_wait)

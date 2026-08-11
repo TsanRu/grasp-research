@@ -73,6 +73,7 @@ class _Open3DViewer:
             opt.background_color = np.array([0.15, 0.15, 0.15])
             opt.point_size = 2.5
             current_geoms = []
+            close_count = 0
             while True:
                 try:
                     new_geoms = self._geom_queue.get_nowait()
@@ -86,7 +87,11 @@ class _Open3DViewer:
                 except queue.Empty:
                     pass
                 if not vis.poll_events():
-                    break   # 使用者關閉視窗，結束 thread
+                    close_count += 1
+                    if close_count >= 5:
+                        break   # 連續 5 次才真的認定視窗被關閉
+                else:
+                    close_count = 0
                 vis.update_renderer()
                 time.sleep(0.02)
         except Exception as e:
@@ -195,9 +200,6 @@ class AnyGraspHandoverNode:
         self.rotation_angle_deg      = 0.0
         # FoundationPose 給的物件 pose (camera frame, 4x4)
         self.object_pose_in_cam = None
-        # dual_no_llm 模式：幾何中心（不靠 mask）
-        self.no_llm_object_centroid_world   = None
-        self.no_llm_receiver_centroid_world = None
 
         # debug 視覺化：Open3D Visualizer 各自跑在 daemon thread，不阻塞 ROS node
         if self.cfgs.debug:
@@ -234,14 +236,6 @@ class AnyGraspHandoverNode:
             op = data.get("object_pose_in_cam", None)
             self.object_pose_in_cam = (
                 np.array(op).reshape(4, 4) if op is not None else None)
-
-            # dual_no_llm 模式：幾何中心（不靠 mask）
-            obj_cw = data.get("object_centroid_world", None)
-            recv_cw = data.get("receiver_centroid_world", None)
-            self.no_llm_object_centroid_world = (
-                np.array(obj_cw) if obj_cw is not None else None)
-            self.no_llm_receiver_centroid_world = (
-                np.array(recv_cw) if recv_cw is not None else None)
 
         except (json.JSONDecodeError, TypeError):
             self.target_object = msg.data
@@ -907,34 +901,6 @@ class AnyGraspHandoverNode:
             rospy.logwarn(f"⚠️ RANSAC+ICP 補全失敗: {e}")
             return pts_clean
 
-    def _pts_around_world_centroid(self, centroid_world, points_cam, camera_frame,
-                                    radius=0.15, min_world_z_offset=-0.01):
-        """從 world 座標的中心點，篩選 camera frame 點雲中 radius 範圍內的點。
-        min_world_z_offset：過濾掉 world Z 低於 centroid_world[2] + offset 的點，
-        防止桌面點雲被納入（對 spatula 等薄物件尤其重要）。"""
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                camera_frame, "world", rospy.Time(0), rospy.Duration(1.0))
-            t, q = trans.transform.translation, trans.transform.rotation
-            T_cw = np.eye(4)
-            T_cw[:3, 3] = [t.x, t.y, t.z]
-            T_cw[:3, :3] = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
-            c_cam = (T_cw @ np.append(centroid_world, 1.0))[:3]
-            dists = np.linalg.norm(points_cam - c_cam, axis=1)
-            pts_in_radius = points_cam[dists < radius]
-
-            # 把篩出的點轉回 world 座標，過濾掉接近桌面的點
-            T_wc = np.linalg.inv(T_cw)
-            pts_h = np.hstack([pts_in_radius, np.ones((len(pts_in_radius), 1))])
-            pts_world_z = (T_wc @ pts_h.T).T[:, 2]
-            min_z = centroid_world[2] + min_world_z_offset
-            pts_in_radius = pts_in_radius[pts_world_z >= min_z]
-
-            return self.filter_outlier_points(pts_in_radius)
-        except Exception as e:
-            rospy.logwarn(f"⚠️ _pts_around_world_centroid 失敗: {e}")
-            return np.empty((0, 3), dtype=np.float32)
-
     def compute_receiver_lims(self, points, camera_frame, radius=0.12):
         """
         以 receiver_centroid_world 為中心，直接建固定大小的 lims。
@@ -1091,9 +1057,6 @@ class AnyGraspHandoverNode:
             })
 
         arm_grasps.sort(key=lambda x: x['arm_score'], reverse=True)
-        for item in arm_grasps[:5]:
-            t = item['grasp'].translation
-            rospy.loginfo(f"[DEBUG] {arm_name} grasp candidate: pos(cam)=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] score={item['arm_score']:.3f}")
         return arm_grasps
     
     def generate_giver_only_plan(self, right_grasps):
@@ -1399,46 +1362,36 @@ class AnyGraspHandoverNode:
                     self.plan_pub.publish(json.dumps([]))
                 return
 
-            if mode in ("left_only", "left_no_llm"):
-                _thin_pad_lo = 0.03 if self.target_object in {
-                    "scissors", "screwdriver", "spatula", "spoon"} else 0.0
+            if mode == "left_only":
+                rospy.loginfo("🧠 left_only：用 receiver_mask 直接在桌面偵測左手夾取姿態")
 
-                if mode == "left_no_llm":
-                    rospy.loginfo("🧠 left_no_llm：整個物件點雲 → 左手夾取")
-                    if self.no_llm_object_centroid_world is None:
-                        rospy.logerr("❌ left_no_llm 缺少 object_centroid_world")
-                        self.plan_pub.publish(json.dumps([]))
-                        return
-                    pts_recv = self._pts_around_world_centroid(
-                        self.no_llm_object_centroid_world, points_full,
-                        camera_frame, radius=0.15)
-                else:
-                    rospy.loginfo("🧠 left_only：用 receiver_mask 偵測左手夾取姿態")
-                    if not os.path.exists(receiver_mask_path):
-                        rospy.logerr("❌ 找不到 receiver_mask（left_only 需要 brain 先完成）")
-                        self.plan_pub.publish(json.dumps([]))
-                        return
-                    mask_recv_img = cv2.imread(receiver_mask_path, cv2.IMREAD_GRAYSCALE)
-                    mask_recv = cv2.resize(
-                        mask_recv_img, (color_np.shape[1], color_np.shape[0])) > 127
-                    pts_recv = np.stack(
-                        [points_x, points_y, points_z],
-                        axis=-1)[valid_depth_mask & mask_recv].astype(np.float32)
-                    pts_recv = self.filter_outlier_points(pts_recv)
-
-                if pts_recv.shape[0] < 50:
-                    rospy.logwarn(f"⚠️ {mode}：點雲過少，中止")
+                if not os.path.exists(receiver_mask_path):
+                    rospy.logerr("❌ 找不到 receiver_mask（left_only 需要 LLM 先完成）")
                     self.plan_pub.publish(json.dumps([]))
                     return
 
+                mask_recv_img = cv2.imread(receiver_mask_path, cv2.IMREAD_GRAYSCALE)
+                mask_recv = cv2.resize(
+                    mask_recv_img, (color_np.shape[1], color_np.shape[0])) > 127
+                pts_recv = np.stack(
+                    [points_x, points_y, points_z],
+                    axis=-1)[valid_depth_mask & mask_recv].astype(np.float32)
+                pts_recv = self.filter_outlier_points(pts_recv)
+
+                if pts_recv.shape[0] < 50:
+                    rospy.logwarn("⚠️ left_only：遮罩內點雲過少，中止")
+                    self.plan_pub.publish(json.dumps([]))
+                    return
+
+                _thin_pad_lo = 0.03 if self.target_object in {"scissors", "screwdriver", "spatula", "spoon"} else 0.0
                 lims_recv = self.get_dynamic_lims(pts_recv, pad=_thin_pad_lo)
                 if not lims_recv:
-                    rospy.logwarn(f"⚠️ {mode}：無法計算 lims")
+                    rospy.logwarn("⚠️ left_only：無法計算 lims")
                     self.plan_pub.publish(json.dumps([]))
                     return
 
                 rospy.loginfo(
-                    f"[DEBUG] {mode} 餵 AnyGrasp: "
+                    f"[DEBUG] left_only 餵 AnyGrasp: "
                     f"pts={pts_recv.shape[0]}, lims={lims_recv}")
 
                 gg_recv, _ = self.anygrasp.get_grasp(
@@ -1450,7 +1403,7 @@ class AnyGraspHandoverNode:
                 torch.cuda.empty_cache()
 
                 if gg_recv is None or len(gg_recv) == 0:
-                    rospy.logwarn(f"⚠️ {mode} 找不到姿態")
+                    rospy.logwarn("⚠️ left_only 找不到姿態")
                     self.plan_pub.publish(json.dumps([]))
                     return
 
@@ -1463,56 +1416,34 @@ class AnyGraspHandoverNode:
 
                 if json_plan:
                     self.plan_pub.publish(json.dumps(json_plan))
-                    rospy.loginfo(f"✅ {mode} 計畫書發布，共 {len(json_plan)} 個姿態")
+                    rospy.loginfo(
+                        f"✅ left_only 計畫書發布，共 {len(json_plan)} 個姿態")
                 else:
-                    rospy.logwarn(f"❌ {mode} 找不到有效姿態")
+                    rospy.logwarn("❌ left_only 找不到有效姿態")
                     self.plan_pub.publish(json.dumps([]))
                 return
 
+            mask_recv_img = cv2.imread(receiver_mask_path, cv2.IMREAD_GRAYSCALE)
+            mask_recv = cv2.resize(
+                mask_recv_img, (color_np.shape[1], color_np.shape[0])) > 127
+            pts_recv = np.stack(
+                [points_x, points_y, points_z],
+                axis=-1)[valid_depth_mask & mask_recv].astype(np.float32)
+            pts_recv = self.filter_outlier_points(pts_recv)
             _thin_objects = {"scissors", "screwdriver", "spatula", "spoon"}
             _thin_pad = 0.03 if self.target_object in _thin_objects else 0.0
-
-            if mode == "dual_no_llm":
-                # =========================================================
-                # dual_no_llm 模式：整個物件 lims，只生成給予臂姿態
-                # 接收臂由後續 receiver_only 流程處理，不在這裡處理
-                # =========================================================
-                # 直接讀 SAM 的整體物件 mask，跟 dual 模式一樣的點雲篩選方式
-                mask_giver_img = cv2.imread(giver_mask_path, cv2.IMREAD_GRAYSCALE)
-                mask_giver = cv2.resize(
-                    mask_giver_img, (color_np.shape[1], color_np.shape[0])) > 127
-                pts_giver = np.stack(
-                    [points_x, points_y, points_z],
-                    axis=-1)[valid_depth_mask & mask_giver].astype(np.float32)
-                pts_giver = self.filter_outlier_points(pts_giver)
-                pts_recv = np.empty((0, 3), dtype=np.float32)
-                rospy.loginfo(f"[dual_no_llm] pts_giver={pts_giver.shape[0]}")
-
-            else:
-                # =========================================================
-                # dual 模式（預設）：從 LLM 輸出的 mask 取點雲
-                # =========================================================
-                mask_recv_img = cv2.imread(receiver_mask_path, cv2.IMREAD_GRAYSCALE)
-                mask_recv = cv2.resize(
-                    mask_recv_img, (color_np.shape[1], color_np.shape[0])) > 127
-                pts_recv = np.stack(
-                    [points_x, points_y, points_z],
-                    axis=-1)[valid_depth_mask & mask_recv].astype(np.float32)
-                pts_recv = self.filter_outlier_points(pts_recv)
-
-                mask_giver_img = cv2.imread(giver_mask_path, cv2.IMREAD_GRAYSCALE)
-                mask_giver = cv2.resize(
-                    mask_giver_img, (color_np.shape[1], color_np.shape[0])) > 127
-                pts_giver = np.stack(
-                    [points_x, points_y, points_z],
-                    axis=-1)[valid_depth_mask & mask_giver].astype(np.float32)
-                pts_giver = self.filter_outlier_points(pts_giver)
-
             lims_recv = self.get_dynamic_lims(pts_recv, pad=_thin_pad)
 
             # =========================================================
-            # dual / dual_no_llm 模式：生成左右手姿態並配對
+            # dual 模式：生成左右手姿態並配對
             # =========================================================
+            mask_giver_img = cv2.imread(giver_mask_path, cv2.IMREAD_GRAYSCALE)
+            mask_giver = cv2.resize(
+                mask_giver_img, (color_np.shape[1], color_np.shape[0])) > 127
+            pts_giver = np.stack(
+                [points_x, points_y, points_z],
+                axis=-1)[valid_depth_mask & mask_giver].astype(np.float32)
+            pts_giver = self.filter_outlier_points(pts_giver)
             lims_giver = self.get_dynamic_lims(pts_giver, pad=_thin_pad)
 
             if not lims_giver:
@@ -1520,10 +1451,6 @@ class AnyGraspHandoverNode:
                 self.plan_pub.publish(json.dumps([]))
                 return
 
-            rospy.loginfo(f"[DEBUG] lims_giver (cam frame): xmin={lims_giver[0]:.3f} xmax={lims_giver[1]:.3f} "
-                          f"ymin={lims_giver[2]:.3f} ymax={lims_giver[3]:.3f} "
-                          f"zmin={lims_giver[4]:.3f} zmax={lims_giver[5]:.3f}")
-            rospy.loginfo(f"[DEBUG] pts_giver shape={pts_giver.shape}, centroid(cam)={pts_giver.mean(axis=0).round(3)}")
             rospy.loginfo("🧠 dual 模式：生成操作臂姿態...")
             gg_giver, _ = self.anygrasp.get_grasp(
                 points_full, colors_full,
@@ -1541,108 +1468,107 @@ class AnyGraspHandoverNode:
             top_k = 20
             gg_giver = gg_giver.nms().sort_by_score()[:top_k]
             giver_filtered = self.get_arm_specific_grasps(gg_giver, "rightarm", camera_frame)
-            self.publish_grasp_markers(giver_filtered, camera_frame)
             json_plan = self.generate_giver_only_plan(giver_filtered)
 
-            if not json_plan:
-                rospy.logwarn("⚠️ dual：arm 過濾後無有效姿態")
-                self.plan_pub.publish(json.dumps([]))
-                return
-
-            self.plan_pub.publish(json.dumps(json_plan))
-            rospy.loginfo(f"✅ dual 計畫書發布，共 {len(json_plan)} 個方案")
-
-            try:
-                trans = self.tf_buffer.lookup_transform(
-                    "world", camera_frame, rospy.Time(0), rospy.Duration(1.0))
-                t = trans.transform.translation
-                q = trans.transform.rotation
-                T = np.eye(4)
-                T[:3, 3] = [t.x, t.y, t.z]
-                T[:3, :3] = Rotation.from_quat(
-                    [q.x, q.y, q.z, q.w]).as_matrix()
-
-                pts_giver_h = np.hstack(
-                    [pts_giver, np.ones((len(pts_giver), 1))])
-                pts_giver_world = (T @ pts_giver_h.T).T[:, :3]
-
-                # 合併 giver + recv 點雲作為完整物件點雲供 ICP 使用
-                pts_full_object = np.vstack([pts_giver, pts_recv]) \
-                    if pts_recv.shape[0] >= 10 else pts_giver
-                pts_full_object_h = np.hstack(
-                    [pts_full_object, np.ones((len(pts_full_object), 1))])
-                pts_full_object_world = (T @ pts_full_object_h.T).T[:, :3]
-
-                if pts_recv.shape[0] >= 10:
-                    rc_h = np.array([*np.mean(pts_recv, axis=0), 1.0])
-                    rc_world = (T @ rc_h)[:3].tolist()
-                else:
-                    rc_world = None
-
-                gc_h = np.array([*np.mean(pts_giver, axis=0), 1.0])
-                gc_world = (T @ gc_h)[:3].tolist()
-                global_mask_path = os.path.join(self.mask_dir, "sam_global_mask_full.png")
-                if os.path.exists(global_mask_path):
-                    mask_full_img = cv2.imread(global_mask_path, cv2.IMREAD_GRAYSCALE)
-                    mask_full = cv2.resize(
-                        mask_full_img,
-                        (color_np.shape[1], color_np.shape[0])) > 127
-                    pts_full_obj_cam = np.stack(
-                        [points_x, points_y, points_z],
-                        axis=-1)[valid_depth_mask & mask_full].astype(np.float32)
-                    pts_full_obj_cam = self.filter_outlier_points(pts_full_obj_cam)
-                    if len(pts_full_obj_cam) >= 10:
-                        pts_full_obj_h = np.hstack(
-                            [pts_full_obj_cam, np.ones((len(pts_full_obj_cam), 1))])
-                        pts_full_obj_world = (T @ pts_full_obj_h.T).T[:, :3]
-                        oc_world = np.mean(pts_full_obj_world, axis=0).tolist()
+            if json_plan:
+                self.plan_pub.publish(json.dumps(json_plan))
+                rospy.loginfo(f"✅ dual 計畫書發布，共 {len(json_plan)} 個方案")
+                
+                try:
+                    trans = self.tf_buffer.lookup_transform(
+                        "world", camera_frame, rospy.Time(0), rospy.Duration(1.0))
+                    t = trans.transform.translation
+                    q = trans.transform.rotation
+                    T = np.eye(4)
+                    T[:3, 3] = [t.x, t.y, t.z]
+                    T[:3, :3] = Rotation.from_quat(
+                        [q.x, q.y, q.z, q.w]).as_matrix()
+ 
+                    pts_giver_h = np.hstack(
+                        [pts_giver, np.ones((len(pts_giver), 1))])
+                    pts_giver_world = (T @ pts_giver_h.T).T[:, :3]
+ 
+                    # 合併 giver + recv 點雲作為完整物件點雲供 ICP 使用
+                    pts_full_object = np.vstack([pts_giver, pts_recv]) \
+                        if pts_recv.shape[0] >= 10 else pts_giver
+                    pts_full_object_h = np.hstack(
+                        [pts_full_object, np.ones((len(pts_full_object), 1))])
+                    pts_full_object_world = (T @ pts_full_object_h.T).T[:, :3]
+ 
+                    if pts_recv.shape[0] >= 10:
+                        rc_h = np.array([*np.mean(pts_recv, axis=0), 1.0])
+                        rc_world = (T @ rc_h)[:3].tolist()
+                    else:
+                        rc_world = None
+                        
+                    gc_h = np.array([*np.mean(pts_giver, axis=0), 1.0])
+                    gc_world = (T @ gc_h)[:3].tolist()
+                    global_mask_path = os.path.join(self.mask_dir, "sam_global_mask_full.png")
+                    if os.path.exists(global_mask_path):
+                        mask_full_img = cv2.imread(global_mask_path, cv2.IMREAD_GRAYSCALE)
+                        mask_full = cv2.resize(
+                            mask_full_img,
+                            (color_np.shape[1], color_np.shape[0])) > 127
+                        pts_full_obj_cam = np.stack(
+                            [points_x, points_y, points_z],
+                            axis=-1)[valid_depth_mask & mask_full].astype(np.float32)
+                        pts_full_obj_cam = self.filter_outlier_points(pts_full_obj_cam)
+                        if len(pts_full_obj_cam) >= 10:
+                            pts_full_obj_h = np.hstack(
+                                [pts_full_obj_cam, np.ones((len(pts_full_obj_cam), 1))])
+                            pts_full_obj_world = (T @ pts_full_obj_h.T).T[:, :3]
+                            oc_world = np.mean(pts_full_obj_world, axis=0).tolist()
+                        else:
+                            # fallback：原本的合併算法
+                            oc_world = np.mean(pts_full_object_world, axis=0).tolist()
                     else:
                         oc_world = np.mean(pts_full_object_world, axis=0).tolist()
+ 
+                except Exception as e:
+                    rospy.logwarn(f"點雲座標轉換失敗，使用相機座標: {e}")
+                    pts_giver_world = pts_giver
+                    pts_full_object_world = pts_giver
+                    rc_world = np.mean(pts_recv, axis=0).tolist() \
+                        if pts_recv.shape[0] >= 10 else None
+                    gc_world = np.mean(pts_giver, axis=0).tolist()
+                    oc_world = np.mean(pts_full_object_world, axis=0).tolist() \
+                        if pts_full_object_world is not None \
+                        else np.mean(pts_giver, axis=0).tolist()
+
+                object_points_pub = rospy.Publisher(
+                    "/anygrasp/object_points", String, queue_size=1)
+                rospy.sleep(0.1)  # 等 publisher 建立
+                model_path = self.find_ycb_model_path(self.target_object)
+                rospy.loginfo(f"🔍 model_path: {model_path}")
+                if model_path:
+                    refined_pts = self.refine_points_with_icp(pts_full_object_world, model_path)
                 else:
-                    oc_world = np.mean(pts_full_object_world, axis=0).tolist()
+                    refined_pts = pts_giver_world
 
-            except Exception as e:
-                rospy.logwarn(f"點雲座標轉換失敗，使用相機座標: {e}")
-                pts_giver_world = pts_giver
-                pts_full_object_world = pts_giver
-                rc_world = np.mean(pts_recv, axis=0).tolist() \
-                    if pts_recv.shape[0] >= 10 else None
-                gc_world = np.mean(pts_giver, axis=0).tolist()
-                oc_world = np.mean(pts_full_object_world, axis=0).tolist() \
-                    if pts_full_object_world is not None \
-                    else np.mean(pts_giver, axis=0).tolist()
-
-            object_points_pub = rospy.Publisher(
-                "/anygrasp/object_points", String, queue_size=1)
-            rospy.sleep(0.1)  # 等 publisher 建立
-            model_path = self.find_ycb_model_path(self.target_object)
-            rospy.loginfo(f"🔍 model_path: {model_path}")
-            if model_path:
-                refined_pts = self.refine_points_with_icp(pts_full_object_world, model_path)
+                object_points_pub.publish(json.dumps({
+                    "points": refined_pts.tolist(),
+                    "receiver_centroid": rc_world,
+                    "giver_centroid": gc_world, 
+                    "object_centroid": oc_world 
+                }))
+                
+                if self.cfgs.debug:
+                    trans_mat = np.array([[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1]])
+                    cloud = o3d.geometry.PointCloud()
+                    cloud.points = o3d.utility.Vector3dVector(points_full)
+                    cloud.colors = o3d.utility.Vector3dVector(colors_full)
+                    cloud.transform(trans_mat)
+                    vis_list = [cloud]
+                    for item in giver_filtered:
+                        gripper = item['grasp'].to_open3d_geometry()
+                        gripper.transform(trans_mat)
+                        gripper.paint_uniform_color([1, 0, 0])
+                        vis_list.append(gripper)
+                    self._show_as_cv_window(vis_list, "AnyGrasp 給予臂")
+                    rospy.loginfo("👀 [Debug] 給予臂夾取姿態（左下角視窗）")
             else:
-                refined_pts = pts_giver_world
-
-            object_points_pub.publish(json.dumps({
-                "points": refined_pts.tolist(),
-                "receiver_centroid": rc_world,
-                "giver_centroid": gc_world,
-                "object_centroid": oc_world
-            }))
-
-            if self.cfgs.debug:
-                trans_mat = np.array([[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1]])
-                cloud = o3d.geometry.PointCloud()
-                cloud.points = o3d.utility.Vector3dVector(points_full)
-                cloud.colors = o3d.utility.Vector3dVector(colors_full)
-                cloud.transform(trans_mat)
-                vis_list = [cloud]
-                for item in giver_filtered:
-                    gripper = item['grasp'].to_open3d_geometry()
-                    gripper.transform(trans_mat)
-                    gripper.paint_uniform_color([1, 0, 0])
-                    vis_list.append(gripper)
-                self._show_as_cv_window(vis_list, "AnyGrasp 給予臂")
-                rospy.loginfo("👀 [Debug] 給予臂夾取姿態（左下角視窗）")
+                rospy.logwarn("❌ dual 模式找不到可行方案")
+                self.plan_pub.publish(json.dumps([]))
 
         except Exception as e:
             rospy.logerr(f"管線發生錯誤: {e}")

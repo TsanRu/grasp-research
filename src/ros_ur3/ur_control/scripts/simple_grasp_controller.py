@@ -25,7 +25,8 @@ from tf.transformations import quaternion_matrix, quaternion_from_euler, quatern
 from gazebo_ros_link_attacher.srv import Attach, AttachRequest, AttachResponse
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
 from gazebo_msgs.srv import GetModelState
-    
+from affordance_gt import OBJECT_AFFORDANCE_AXIS, world_point_to_axis_ratio, is_handle_grasp
+
 class SimpleGraspController:
     def __init__(self):
         # 1. --- 初始化 MoveIt! & ROS ---
@@ -114,6 +115,7 @@ class SimpleGraspController:
         
         self.handover_strategy = "geometric"   # 從 brain 接收
         self.receiver_part = None              # functional_end 時的接取部位名稱
+        self.resolved_object_name = None       # brain 意圖解析後的英文物件名
         self.object_points_for_pca = None      # 夾取後暫存物件點雲供 PCA 使用
         self.receiver_centroid_for_pca = None
         self.giver_centroid_for_pca = None
@@ -150,7 +152,9 @@ class SimpleGraspController:
         self.metric_rotation_angle = None
         self.metric_hoe_value      = None
         self.metric_hoe_label      = None
-        
+        self.metric_affordance_ratio = None
+        self.metric_affordance_hit   = None
+
     # --- 設定規劃場景 (加入桌子) ---
     def setup_planning_scene(self):
         """將 Gazebo 中的環境物件 (如桌子) 加入 MoveIt! 以進行碰撞檢測"""
@@ -507,6 +511,7 @@ class SimpleGraspController:
                 self.left_move_group.stop()
                 # ── 精度診斷 ──
                 rospy.sleep(0.3)
+                tf_t = None
                 try:
                     tw = self.tf_buffer.lookup_transform(
                         "world", "leftarm_wrist_3_link",
@@ -530,7 +535,41 @@ class SimpleGraspController:
                     rospy.logwarn(f"診斷失敗: {e}")
                 # ── 診斷結束 ──
 
-                self.control_gripper(0.1, arm="left")
+                # ── Affordance GT 指標：左手接觸點是否落在握柄 GT 區間 ──
+                # 用 tf_t（左手指尖闔爪前的世界座標，上面精度診斷已經量過）
+                # 搭配 Gazebo ground truth 物件姿態換算，避免把 FoundationPose
+                # 的估測誤差混進這個指標。只對已標定 affordance 主軸的物件量測。
+                if object_name in OBJECT_AFFORDANCE_AXIS and tf_t is not None:
+                    try:
+                        rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+                        get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+                        obj_state = get_model_state(object_name, 'world')
+                        obj_pos = (obj_state.pose.position.x,
+                                   obj_state.pose.position.y,
+                                   obj_state.pose.position.z)
+                        obj_quat = (obj_state.pose.orientation.x,
+                                    obj_state.pose.orientation.y,
+                                    obj_state.pose.orientation.z,
+                                    obj_state.pose.orientation.w)
+                        point_world = (tf_t.x, tf_t.y, tf_t.z)
+                        ratio = world_point_to_axis_ratio(point_world, obj_pos, obj_quat, object_name)
+                        hit = is_handle_grasp(object_name, ratio)
+                        self.metric_affordance_ratio = ratio
+                        self.metric_affordance_hit = hit
+                        # 物件此時仍 attach 在右手上，正常應在交接高度附近（>0.4m）。
+                        # 若明顯偏低，代表途中可能已經飛出/掉落，這筆數據不可信，
+                        # 標記出來以便事後稽核，不用再依賴肉眼即時盯著畫面。
+                        suspicious = obj_pos[2] < 0.4
+                        flag = "  ⚠️ SUSPICIOUS(物件位置異常，疑似飛出/掉落)" if suspicious else ""
+                        rospy.loginfo(
+                            f"[Affordance] {object_name}: 左手接觸點主軸位置={ratio * 100:.1f}%  "
+                            f"落在握柄GT={'是' if hit else '否'}  "
+                            f"obj_pos=({obj_pos[0]:.3f}, {obj_pos[1]:.3f}, {obj_pos[2]:.3f}){flag}")
+                    except Exception as e:
+                        rospy.logwarn(f"[Affordance] 量測失敗: {e}")
+                # ── Affordance GT 指標結束 ──
+
+                self.control_gripper(0.0, arm="left")
                 rospy.sleep(1.0)
                 self.attach_object(object_name, arm="left")
                 self.detach_object(object_name, arm="right")
@@ -619,10 +658,18 @@ class SimpleGraspController:
                     rospy.loginfo(f"  {label:<28}: {self.metric_hoe_value:+.1f}°")
                 else:
                     rospy.loginfo("  HOE                         : N/A")
+                if self.metric_affordance_ratio is not None:
+                    rospy.loginfo(
+                        f"  Affordance (握柄GT)         : {self.metric_affordance_ratio * 100:.1f}%  "
+                        f"({'HIT' if self.metric_affordance_hit else 'MISS'})")
+                else:
+                    rospy.loginfo("  Affordance (握柄GT)         : N/A")
                 rospy.loginfo(_sep)
                 self.result_pub.publish(json.dumps({
                     "status": "success",
-                    "method": "air_handover"
+                    "method": "air_handover",
+                    "affordance_ratio": self.metric_affordance_ratio,
+                    "affordance_hit": self.metric_affordance_hit,
                 }))
                 return True
 
@@ -689,7 +736,7 @@ class SimpleGraspController:
                 continue
 
             self.left_move_group.stop()
-            self.control_gripper(0.1, arm="left")
+            self.control_gripper(0.0, arm="left")
             rospy.sleep(1.0)
             self.attach_object(object_name, arm="left")
 
@@ -789,99 +836,8 @@ class SimpleGraspController:
         self.latest_fp_pose_cam = pose
         return pose
     
-    def _trigger_dual_no_llm(self, object_name, timeout=120.0):
-        """NO_LLM_MODE 用：從 Gazebo 取得物件中心，觸發 AnyGrasp dual_no_llm。
-        給予臂以整個物件 lims 讓 AnyGrasp 選最佳姿態，接收臂由 receiver_only 流程處理。"""
-        try:
-            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
-            get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
-            resp = get_state(object_name, 'world')
-            obj_center = np.array([
-                resp.pose.position.x,
-                resp.pose.position.y,
-                resp.pose.position.z,
-            ])
-        except Exception as e:
-            rospy.logerr(f"[no_llm] 無法取得 {object_name} Gazebo 位置: {e}")
-            return None
-
-        rospy.loginfo(f"[no_llm] obj_center={obj_center.round(3)}")
-
-        plan_event = threading.Event()
-        plan_container = [None]
-
-        def plan_cb(msg):
-            try:
-                plan_container[0] = json.loads(msg.data)
-                plan_event.set()
-            except Exception:
-                pass
-
-        plan_sub = rospy.Subscriber("/anygrasp/handover_plan", String, plan_cb)
-        rospy.sleep(0.2)
-
-        anygrasp_payload = json.dumps({
-            "object_name": object_name,
-            "mode": "dual_no_llm",
-            "object_centroid_world": obj_center.tolist(),
-        })
-        self.anygrasp_trigger_pub.publish(anygrasp_payload)
-
-        plan_done = plan_event.wait(timeout=timeout)
-        plan_sub.unregister()
-
-        if not plan_done or plan_container[0] is None:
-            rospy.logerr("[no_llm] 等待 AnyGrasp dual_no_llm 回傳逾時")
-            return None
-
-        ranked = plan_container[0]
-        return ranked if ranked else None
-
-    def _trigger_left_no_llm(self, object_name, timeout=60.0):
-        """NO_LLM_MODE fallback：物件已放回桌面，直接用 Gazebo 中心觸發左臂偵測。"""
-        try:
-            rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
-            get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
-            resp = get_state(object_name, 'world')
-            obj_center = np.array([
-                resp.pose.position.x,
-                resp.pose.position.y,
-                resp.pose.position.z,
-            ])
-        except Exception as e:
-            rospy.logerr(f"[no_llm] 無法取得 {object_name} Gazebo 位置: {e}")
-            return None
-
-        plan_event = threading.Event()
-        plan_container = [None]
-
-        def plan_cb(msg):
-            try:
-                plan_container[0] = json.loads(msg.data)
-                plan_event.set()
-            except Exception:
-                pass
-
-        plan_sub = rospy.Subscriber("/anygrasp/handover_plan", String, plan_cb)
-        rospy.sleep(0.2)
-        self.anygrasp_trigger_pub.publish(json.dumps({
-            "object_name": object_name,
-            "mode": "left_no_llm",
-            "object_centroid_world": obj_center.tolist(),
-        }))
-
-        plan_done = plan_event.wait(timeout=timeout)
-        plan_sub.unregister()
-
-        if not plan_done or plan_container[0] is None:
-            rospy.logerr("[no_llm] 等待 AnyGrasp left_no_llm 回傳逾時")
-            return None
-
-        result = plan_container[0]
-        return result if result else None
-
     def trigger_full_detection(self, object_name, mode="dual",
-                           rotation_angle=0.0, timeout=120.0):
+                           rotation_angle=0.0, timeout=120.0, user_input=None):
         
         # # ── receiver_only：跳過 LLM，直接觸發 AnyGrasp ──
         # if mode == "receiver_only":
@@ -988,7 +944,10 @@ class SimpleGraspController:
             return ranked if ranked else None
     
         rospy.loginfo(f"觸發 LLM 前處理 (物件: {object_name}, 模式: {mode})...")
-        llm_payload = json.dumps({"object_name": object_name, "mode": mode})
+        if user_input:
+            llm_payload = json.dumps({"user_input": user_input, "mode": mode})
+        else:
+            llm_payload = json.dumps({"object_name": object_name, "mode": mode})
 
         llm_done_event = threading.Event()
         llm_result_container = [None]
@@ -1016,13 +975,15 @@ class SimpleGraspController:
         rospy.loginfo("LLM 完成，觸發 AnyGrasp...")
         
         llm_data = llm_result_container[0]
-        if mode in ("dual", "no_llm"):
+        # 如果 brain 回傳了解析後的英文物件名（意圖解析場景），存起來供 execute_mission 使用
+        resolved = llm_data.get("object_name", "")
+        if resolved and resolved != "unknown":
+            self.resolved_object_name = resolved
+            object_name = resolved
+        if mode == "dual":  # 只有 dual 才更新策略
             self.handover_strategy = llm_data.get("handover_strategy", "geometric")
             self.receiver_part = llm_data.get("receiver_part", None)
             rospy.loginfo(f"📋 交接策略: {self.handover_strategy}, 接取部位: {self.receiver_part}")
-
-        # no_llm → brain 已產生 mask，AnyGrasp 讀 dual pipeline；left_no_llm → left_only pipeline
-        anygrasp_mode = {"no_llm": "dual", "left_no_llm": "left_only"}.get(mode, mode)
 
         plan_event = threading.Event()
         plan_container = [None]
@@ -1039,7 +1000,7 @@ class SimpleGraspController:
         rospy.sleep(0.2)
         anygrasp_payload = json.dumps({
             "object_name": object_name,
-            "mode": anygrasp_mode
+            "mode": mode
         })
         self.anygrasp_trigger_pub.publish(anygrasp_payload)
 
@@ -1244,9 +1205,6 @@ class SimpleGraspController:
         "C（內收前伸）": [0.7,  -0.8,  -2.0,  -0.8,  1.8,    -0.3],
     }
 
-    # 消融實驗旗標：True = 不使用 LLM，改用幾何規則選抓取區域
-    NO_LLM_MODE = True
-
     # 各物件理想交接 yaw（世界座標，handle 朝向左臂 -Y 方向）
     IDEAL_YAW = {
         "hammer":              -21.5,
@@ -1267,8 +1225,6 @@ class SimpleGraspController:
         "spatula":     "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/033_spatula/google_16k/nontextured.stl",
         "spoon":       "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/031_spoon/google_16k/nontextured.stl",
         "tomato_soup_can": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/005_tomato_soup_can/google_16k/nontextured.stl",
-        "banana":          "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/011_banana/google_16k/nontextured.stl",
-        "bowl":            "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/024_bowl/google_16k/nontextured.stl",
     }
     COLLISION_MESH_SCALE = 0.85  # 略小於實際，補償 FP 位姿誤差
 
@@ -1394,7 +1350,7 @@ class SimpleGraspController:
             rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
 
     def execute_mission(self):
-        TARGET_OBJECT_NAME = "spatula"
+        user_input = input("請描述你想要的物件：").strip()
 
         # 重置每次實驗的 metrics 與狀態
         self.metric_mission_start  = rospy.Time.now()
@@ -1403,19 +1359,23 @@ class SimpleGraspController:
         self.metric_rotation_angle = None
         self.metric_hoe_value      = None
         self.metric_hoe_label      = None
+        self.metric_affordance_ratio = None
+        self.metric_affordance_hit   = None
         self.latest_fp_pose_cam    = None
-        self._remove_collision_mesh(TARGET_OBJECT_NAME)  # 清除上次殘留
+        self.resolved_object_name  = None
 
         # =========================================================
-        # 階段一：視覺偵測，取得右手夾取姿態
+        # 階段一：視覺偵測，取得右手夾取姿態（brain 同時解析意圖）
         # =========================================================
-        if self.NO_LLM_MODE:
-            ranked_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="dual_no_llm")
-        else:
-            ranked_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="dual")
+        ranked_groups = self.trigger_full_detection("", mode="dual", user_input=user_input)
         if ranked_groups is None:
-            rospy.logerr("初始偵測失敗，任務中止")
             return
+        TARGET_OBJECT_NAME = self.resolved_object_name
+        if not TARGET_OBJECT_NAME:
+            rospy.logerr("❌ 無法取得解析後的物件名稱，任務中止")
+            return
+        rospy.loginfo(f"🎯 目標物件確定為：{TARGET_OBJECT_NAME}")
+        self._remove_collision_mesh(TARGET_OBJECT_NAME)  # 清除上次殘留
         self.metric_inference_time = (rospy.Time.now() - self.metric_mission_start).to_sec()
 
         # =========================================================
@@ -1525,7 +1485,7 @@ class SimpleGraspController:
             # ── 診斷結束 ──
             
             # 夾取
-            self.control_gripper(0.1)
+            self.control_gripper(0.0)
             rospy.sleep(1.0)
             self.attach_object(TARGET_OBJECT_NAME, arm="right")
 
@@ -1811,13 +1771,10 @@ class SimpleGraspController:
             self.go_home("right")  # 原地釋放後直接回 Home
 
         rospy.loginfo("右手已退開，觸發左手重新偵測")
-
-        rospy.loginfo("重新觸發左手偵測，讓左手從桌面重新夾取")
+        
+        rospy.loginfo("重新觸發 left_only 偵測，讓左手從桌面重新夾取")
         _t_left_infer = rospy.Time.now()
-        if self.NO_LLM_MODE:
-            left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_no_llm")
-        else:
-            left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_only")
+        left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_only")
         _left_infer_elapsed = (rospy.Time.now() - _t_left_infer).to_sec()
         if self.metric_inference_time is not None:
             self.metric_inference_time += _left_infer_elapsed
