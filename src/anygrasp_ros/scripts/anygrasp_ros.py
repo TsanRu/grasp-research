@@ -1234,7 +1234,7 @@ class AnyGraspHandoverNode:
             receiver_mask_path = os.path.join(self.mask_dir, "receiver_mask.png")
             giver_mask_path = os.path.join(self.mask_dir, "giver_mask.png")
 
-            if mode == "dual":
+            if mode in ("dual", "dual_no_llm"):
                 if not os.path.exists(receiver_mask_path) or \
                         not os.path.exists(giver_mask_path):
                     rospy.logerr("❌ 找不到 receiver_mask 或 giver_mask")
@@ -1362,11 +1362,11 @@ class AnyGraspHandoverNode:
                     self.plan_pub.publish(json.dumps([]))
                 return
 
-            if mode == "left_only":
-                rospy.loginfo("🧠 left_only：用 receiver_mask 直接在桌面偵測左手夾取姿態")
+            if mode in ("left_only", "left_no_llm"):
+                rospy.loginfo(f"🧠 {mode}：用 receiver_mask 直接在桌面偵測左手夾取姿態")
 
                 if not os.path.exists(receiver_mask_path):
-                    rospy.logerr("❌ 找不到 receiver_mask（left_only 需要 LLM 先完成）")
+                    rospy.logerr(f"❌ 找不到 receiver_mask（{mode} 需要前置步驟先完成）")
                     self.plan_pub.publish(json.dumps([]))
                     return
 

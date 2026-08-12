@@ -1205,6 +1205,9 @@ class SimpleGraspController:
         "C（內收前伸）": [0.7,  -0.8,  -2.0,  -0.8,  1.8,    -0.3],
     }
 
+    # 消融實驗開關：True = 跳過語意層（GPT），只用 OWL+SAM 幾何切割
+    NO_LLM_MODE = True
+
     # 各物件理想交接 yaw（世界座標，handle 朝向左臂 -Y 方向）
     IDEAL_YAW = {
         "hammer":              -21.5,
@@ -1225,6 +1228,7 @@ class SimpleGraspController:
         "spatula":     "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/033_spatula/google_16k/nontextured.stl",
         "spoon":       "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/031_spoon/google_16k/nontextured.stl",
         "tomato_soup_can": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/005_tomato_soup_can/google_16k/nontextured.stl",
+        "large_clamp": "/home/rvl/ros_ws/src/ros_ur3/ur_gripper_gazebo/models/051_large_clamp/google_16k/nontextured.stl",
     }
     COLLISION_MESH_SCALE = 0.85  # 略小於實際，補償 FP 位姿誤差
 
@@ -1350,7 +1354,10 @@ class SimpleGraspController:
             rospy.logwarn(f"[collision mesh] 移除失敗: {e}")
 
     def execute_mission(self):
-        user_input = input("請描述你想要的物件：").strip()
+        if self.NO_LLM_MODE:
+            user_input = input("請輸入物件名稱（no-llm 模式，跳過語意層）：").strip()
+        else:
+            user_input = input("請描述你想要的物件：").strip()
 
         # 重置每次實驗的 metrics 與狀態
         self.metric_mission_start  = rospy.Time.now()
@@ -1367,7 +1374,10 @@ class SimpleGraspController:
         # =========================================================
         # 階段一：視覺偵測，取得右手夾取姿態（brain 同時解析意圖）
         # =========================================================
-        ranked_groups = self.trigger_full_detection("", mode="dual", user_input=user_input)
+        if self.NO_LLM_MODE:
+            ranked_groups = self.trigger_full_detection(user_input, mode="dual_no_llm")
+        else:
+            ranked_groups = self.trigger_full_detection("", mode="dual", user_input=user_input)
         if ranked_groups is None:
             return
         TARGET_OBJECT_NAME = self.resolved_object_name
@@ -1772,9 +1782,10 @@ class SimpleGraspController:
 
         rospy.loginfo("右手已退開，觸發左手重新偵測")
         
-        rospy.loginfo("重新觸發 left_only 偵測，讓左手從桌面重新夾取")
+        left_mode = "left_no_llm" if self.NO_LLM_MODE else "left_only"
+        rospy.loginfo(f"重新觸發 {left_mode} 偵測，讓左手從桌面重新夾取")
         _t_left_infer = rospy.Time.now()
-        left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode="left_only")
+        left_groups = self.trigger_full_detection(TARGET_OBJECT_NAME, mode=left_mode)
         _left_infer_elapsed = (rospy.Time.now() - _t_left_infer).to_sec()
         if self.metric_inference_time is not None:
             self.metric_inference_time += _left_infer_elapsed

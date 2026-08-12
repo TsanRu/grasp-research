@@ -520,6 +520,32 @@ class SemanticBrainNode:
             y_max = int(box['ymax'])
             rospy.loginfo(f"   偵測到 '{object_name}'，信心度: {best_pred['score']:.2f}")
 
+            # ── no_llm / left_no_llm / dual_no_llm 模式：跳過 GPT，OWL bbox → SAM 精割 ──
+            if mode in ("no_llm", "left_no_llm", "dual_no_llm"):
+                rospy.loginfo(f"🔷 [{mode}] 跳過 GPT，執行 OWL+SAM")
+                sam_inputs = self.sam_processor(
+                    img_pil,
+                    input_boxes=[[[x_min, y_min, x_max, y_max]]],
+                    return_tensors="pt"
+                ).to(self.device)
+                with torch.no_grad():
+                    sam_outputs = self.sam_model(**sam_inputs)
+                sam_masks = self.sam_processor.image_processor.post_process_masks(
+                    sam_outputs.pred_masks.cpu(),
+                    sam_inputs.original_sizes.cpu(),
+                    sam_inputs.reshaped_input_sizes.cpu()
+                )
+                global_mask = (sam_masks[0][0][0].numpy() * 255).astype(np.uint8)
+                torch.cuda.empty_cache()
+                cv2.imwrite(os.path.join(self.save_dir, "giver_mask.png"), global_mask)
+                cv2.imwrite(os.path.join(self.save_dir, "receiver_mask.png"), global_mask)
+                self.done_pub.publish(json.dumps({
+                    "status": "done", "object_name": object_name, "mode": mode,
+                    "receiver_grids": [], "giver_grids": [],
+                    "handover_strategy": "geometric", "receiver_part": None
+                }))
+                return
+
             # 裁切物件區域
             pad = 20
             c_xmin = max(0, x_min - pad)
